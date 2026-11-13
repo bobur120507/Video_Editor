@@ -71,6 +71,41 @@ async def cmd_caption(args) -> None:
     print(f"\n[{data['source']}]")
 
 
+async def cmd_score(args) -> None:
+    from .scoring import full_report
+
+    print("Scoring… (analyzes both videos)")
+    report = await asyncio.to_thread(full_report, args.reference, args.output, args.pixels)
+    print(report.text())
+
+
+async def cmd_bench(args) -> None:
+    from .bench import run, table
+
+    print("Running match benchmark (several minutes)…")
+    results = await asyncio.to_thread(run, args.case or None, not args.no_camera, not args.no_rife, args.label or "")
+    print(table(results))
+
+
+async def cmd_realtest(args) -> None:
+    from .realtest import run
+
+    print("Testing real Reels (each takes a few minutes)…")
+    results, errors = await asyncio.to_thread(run, Path(args.dir) if args.dir else None)
+    root = Path(args.dir) if args.dir else get_settings().dir("real")
+    if not results:
+        print(f"No cases found. Put each Reel in its own folder under {root}/ (see {root}/HOW_TO.txt)")
+    for r in results:
+        if "error" in r:
+            print(f"{r['case']}: ERROR {r['error']}")
+            continue
+        parts = [f"{k} {r[k]:.1f}%" for k in ("raw_match", "raw_ssim", "self_match", "self_ssim", "style_match") if r.get(k) is not None]
+        print(f"{r['case']}: {r['shots']} shots · " + (" · ".join(parts) or "clone only (add raw/ or _footage/ to score)"))
+    for e in errors:
+        print(f"download error: {e}")
+    print(f"\nFull report with side-by-side frames: {root / 'REPORT.md'}")
+
+
 async def cmd_show(args) -> None:
     tpl = await storage.get_template(LOCAL_USER, nickname=args.template)
     if not tpl:
@@ -106,6 +141,23 @@ def main() -> None:
     p = sub.add_parser("caption", help="Write a caption + hashtags")
     p.add_argument("topic")
     p.set_defaults(fn=cmd_caption)
+
+    p = sub.add_parser("score", help="Match score of an output edit against its reference")
+    p.add_argument("reference")
+    p.add_argument("output")
+    p.add_argument("--pixels", action="store_true", help="Also compare frames (only meaningful with the same footage)")
+    p.set_defaults(fn=cmd_score)
+
+    p = sub.add_parser("bench", help="Ground-truth match benchmark")
+    p.add_argument("--case", action="append", help="Run only this case; repeat for several")
+    p.add_argument("--no-camera", action="store_true", help="Disable camera-motion replay (baseline)")
+    p.add_argument("--no-rife", action="store_true", help="Use FFmpeg minterpolate instead of RIFE")
+    p.add_argument("--label")
+    p.set_defaults(fn=cmd_bench)
+
+    p = sub.add_parser("realtest", help="Clone, re-edit and score real Reels from data/real/")
+    p.add_argument("--dir", help="Test folder (default: data/real)")
+    p.set_defaults(fn=cmd_realtest)
 
     sub.add_parser("bot", help="Run the Telegram bot")
 

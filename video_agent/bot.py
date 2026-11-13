@@ -26,6 +26,7 @@ from .config import get_settings
 from .downloader import download, find_url, instagram_shortcode
 from .media import sha256_file
 from .pipeline import ApplyOutcome, apply, clone
+from .scoring import style_match
 from .tweak import parse_feedback
 
 log = logging.getLogger(__name__)
@@ -404,6 +405,18 @@ async def _render_and_send(message: Message, state: FSMContext, user_id: int, bp
         "Want changes? Just type them, e.g. “darker, faster cuts, more zoom, bigger text”." + tail,
         reply_markup=_after_render_keyboard(),
     )
+    reference = outcome.blueprint.source.path
+    if reference and Path(reference).exists():
+        asyncio.create_task(_send_match_score(message, reference, r.master))
+
+
+async def _send_match_score(message: Message, reference: str, output: Path):
+    """Measure how closely the edit matches the reference (runs after delivery; takes ~a video length)."""
+    try:
+        report = await asyncio.to_thread(style_match, reference, output)
+        await message.answer("📏 " + report.text())
+    except Exception:
+        log.exception("match scoring failed")
 
 
 @router.message(ApplyFlow.feedback, TEXT)

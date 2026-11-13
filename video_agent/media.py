@@ -28,6 +28,9 @@ class Probe:
     fps: float
     has_audio: bool
     rotation: int = 0
+    color_space: str = ""  # matrix tag, e.g. "bt709"; empty when untagged
+    color_range: str = ""  # "tv" (limited), "pc" (full, some Android phones) or empty
+    variable_fps: bool = False  # phone/Instagram downloads often are; frame-exact timing needs constant fps
 
     @property
     def display_size(self) -> tuple[int, int]:
@@ -57,6 +60,8 @@ def probe(path: str | Path) -> Probe:
         raise MediaError(f"No video stream in {path.name}")
     num, _, den = (video.get("avg_frame_rate") or video.get("r_frame_rate") or "30/1").partition("/")
     fps = float(num) / float(den or 1) if float(den or 1) else 30.0
+    rnum, _, rden = (video.get("r_frame_rate") or "0/1").partition("/")
+    r_fps = float(rnum) / float(rden or 1) if float(rden or 1) else fps
     rotation = 0
     for sd in video.get("side_data_list", []) or []:
         if "rotation" in sd:
@@ -72,7 +77,26 @@ def probe(path: str | Path) -> Probe:
         fps=fps if 1 <= fps <= 240 else 30.0,
         has_audio=any(s.get("codec_type") == "audio" for s in data.get("streams", [])),
         rotation=rotation,
+        color_space="" if video.get("color_space") in (None, "unknown") else video["color_space"],
+        color_range="" if video.get("color_range") in (None, "unknown") else video["color_range"],
+        variable_fps=abs(r_fps - fps) > 0.5,
     )
+
+
+STANDARD_FPS = (23.976, 24, 25, 29.97, 30, 50, 59.94, 60)
+
+
+def constant_fps_copy(path: str | Path, dest_dir: str | Path) -> Path:
+    """Return `path`, or a constant-frame-rate copy of it when it is variable or off-standard."""
+    info = probe(path)
+    nearest = min(STANDARD_FPS, key=lambda f: abs(f - info.fps))
+    if not info.variable_fps and abs(nearest - info.fps) < 0.05:
+        return Path(path)
+    dst = Path(dest_dir) / f"{Path(path).stem}_cfr{round(nearest)}.mp4"
+    if not dst.exists():
+        ffmpeg(["-i", path, "-fps_mode", "cfr", "-r", nearest, "-c:v", "libx264", "-crf", 12, "-preset", "fast",
+                "-pix_fmt", "yuv420p", "-c:a", "copy", dst])
+    return dst
 
 
 def sha256_file(path: str | Path) -> str:
@@ -102,11 +126,16 @@ def iter_frames(path: str | Path, sample_fps: float = 10.0, width: int = 320, st
     if start > 0:
         cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
     idx = int(round(start * src_fps))
+    first = True
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
+            if first and start > 0:
+                # Trust the decoder's real position after a seek, not the requested one.
+                idx = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+            first = False
             t = idx / src_fps
             if end is not None and t > end:
                 break
@@ -119,10 +148,27 @@ def iter_frames(path: str | Path, sample_fps: float = 10.0, width: int = 320, st
         cap.release()
 
 
+def frame_at(path: str | Path, t: float, width: int | None = None) -> np.ndarray | None:
+    cap = cv2.VideoCapture(str(path))
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(t * fps)))
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+    if not ok:
+        return None
+    if width:
+        h, w = frame.shape[:2]
+        frame = cv2.resize(frame, (width, int(h * width / w) // 2 * 2), interpolation=cv2.INTER_AREA)
+    return frame
+
+
 def color_stats(frames: list[np.ndarray]) -> dict:
     """Mean colour statistics over BGR frames, all in 0..1."""
     if not frames:
         return {"luma_mean": 0.45, "luma_std": 0.22, "saturation": 0.35, "rgb_mean": (0.45, 0.45, 0.45)}
+    lab = np.concatenate([cv2.cvtColor(f.astype(np.float32) / 255, cv2.COLOR_BGR2LAB).reshape(-1, 3) for f in frames])
     lum, lstd, sat, rgb = [], [], [], []
     for f in frames:
         gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255
@@ -137,4 +183,31 @@ def color_stats(frames: list[np.ndarray]) -> dict:
         "luma_std": float(np.mean(lstd)),
         "saturation": float(np.mean(sat)),
         "rgb_mean": tuple(float(x) for x in np.mean(rgb, axis=0)),
+        "lab_mean": tuple(round(float(x), 4) for x in lab.mean(axis=0)),
+        "lab_std": tuple(round(float(x), 4) for x in lab.std(axis=0)),
     }
+
+
+def thumb(frame: np.ndarray, aspect: float = 9 / 16, size: int = 16, zoom: float = 1.0) -> np.ndarray:
+    """Tiny zero-mean, unit-norm grey thumbnail of the centre `aspect` crop, for content matching.
+
+    The dot product of two thumbs is their correlation (1 = same picture), which ignores
+    brightness/contrast grading.
+    """
+    h, w = frame.shape[:2]
+    if zoom > 1.0:
+        zh, zw = int(h / zoom), int(w / zoom)
+        frame = frame[(h - zh) // 2 : (h - zh) // 2 + zh, (w - zw) // 2 : (w - zw) // 2 + zw]
+        h, w = frame.shape[:2]
+    if w / h > aspect:
+        cw = int(h * aspect)
+        frame = frame[:, (w - cw) // 2 : (w - cw) // 2 + cw]
+    else:
+        ch = int(w / aspect)
+        frame = frame[(h - ch) // 2 : (h - ch) // 2 + ch]
+    h, w = frame.shape[:2]
+    frame = frame[int(h * 0.15) : int(h * 0.85), int(w * 0.15) : int(w * 0.85)]  # skip edges: corners, borders
+    g = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (size, size), interpolation=cv2.INTER_AREA).astype(np.float32)
+    g -= g.mean()
+    n = float(np.linalg.norm(g))
+    return (g / n).reshape(-1) if n > 1e-6 else g.reshape(-1)

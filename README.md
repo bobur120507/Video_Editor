@@ -3,6 +3,7 @@
 Clone the editing style of any short vertical video (cuts, beat sync, speed changes, zooms, flashes,
 colour grade) into a reusable **Edit Blueprint**, then apply it to your own raw clips. You can drive
 it from Telegram or the command line. Full roadmap: [Fully Automated Instagram.md](Fully%20Automated%20Instagram.md).
+What's done and what's left: [CHECKLIST.md](CHECKLIST.md).
 
 ## Setup (Ubuntu)
 
@@ -38,6 +39,9 @@ CLI:
 .venv/bin/video-agent apply car_phonk_v1 clip1.mp4 clip2.mp4 --text "POV: day 1" --tweak "darker"
 .venv/bin/video-agent templates
 .venv/bin/video-agent caption "BMW M4 night drive"
+.venv/bin/video-agent score reference.mp4 my_edit.mp4        # how closely an edit matches its reference
+.venv/bin/video-agent bench                                 # ground-truth match benchmark (~10 min)
+.venv/bin/video-agent realtest                              # clone, re-edit and score real Reels in data/real/ (see data/real/HOW_TO.txt)
 ```
 
 ## How it works
@@ -55,7 +59,12 @@ apply:  Blueprint + clips ─► AI Director (motion-matched clip windows, face-
 |---|---|
 | `video_agent/analysis/` | `/clone` deconstruction |
 | `video_agent/director.py` | Footage audit, shot assignment, subject detection |
-| `video_agent/render/engine.py` | Standard tier (FFmpeg): crop, speed ramps, colour matching, zoom/shake/flash, text, final encode |
+| `video_agent/render/engine.py` | Shot pipeline: crop, speed pieces, grading, effects, text, final encode |
+| `video_agent/analysis/camera.py` | Per-frame camera motion of every reference shot (zoom, rotation, pan, shake) |
+| `video_agent/render/compositor.py` | Keyframe compositor: replays that motion on new footage (minus the footage's own motion), cover zoom, motion blur |
+| `video_agent/render/grade.py` | Colour as 3D LUTs: fitted from aligned frames when the footage is the reference's own, Lab look transfer otherwise |
+| `video_agent/render/rife.py` | RIFE AI frame interpolation for slow motion (Vulkan, runs on the Intel GPU) |
+| `video_agent/scoring.py` / `bench.py` | Match score and the ground-truth benchmark |
 | `video_agent/tweak.py` | Natural-language feedback to blueprint changes, logged to `Learning_Weights` |
 | `video_agent/llm.py` | Hybrid LLM: Claude, OpenRouter, Gemini, OpenAI, tried in `LLM_PROVIDERS` order with fallback |
 | `video_agent/storage.py` | `Brand_Identity`, `Edit_Blueprints`, `Template_Vault`, `Published_Media_Fingerprints`, `Learning_Weights` (SQLite by default, PostgreSQL via `DATABASE_URL`) |
@@ -68,11 +77,23 @@ After Effects doesn't run on Linux, and NexRender needs Windows or macOS. The pl
 | Tier | Engine | Status |
 |---|---|---|
 | Standard | FFmpeg filter graphs | Working |
-| Slow-mo | FFmpeg `minterpolate` optical flow | Working (CPU, slow on long shots) |
-| Slow-mo (AI) | RIFE (`rife-ncnn-vulkan`, runs on Intel iGPU via Vulkan) | Next |
+| Camera moves | Keyframe compositor (per-frame transforms + motion blur) | Working |
+| Slow-mo (AI) | RIFE (`rife-ncnn-vulkan` in `tools/rife/`, Intel iGPU via Vulkan) | Working; FFmpeg `minterpolate` is the fallback |
 | Motion graphics, kinetic text | Remotion (React templates) | Planned |
 | 3D text, camera, VFX | Blender headless (`blender -b -P`) | Planned |
 | After Effects | NexRender on a remote Windows worker | Optional, if a subscription comes back |
+
+### Colour pipeline
+
+Every clip is converted to limited-range BT.709 at the first step (untagged clips are treated as
+BT.601, full-range phone footage is compressed to TV range), every intermediate is tagged, and
+grading runs in 16-bit with accurate rounding. Mismatched tags were the biggest colour error found
+by the benchmark.
+
+### RIFE install
+
+`tools/` is not in git. To reinstall: download `rife-ncnn-vulkan-20221029-ubuntu.zip` from
+https://github.com/nihui/rife-ncnn-vulkan/releases and unzip its contents into `tools/rife/`.
 
 ## Limits to know
 
