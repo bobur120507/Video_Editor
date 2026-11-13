@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, select
+from sqlalchemy import JSON, BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, select, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from .blueprint import Blueprint
 from .config import get_settings
+
+
+# JSONB on PostgreSQL (binary, indexable, queryable); plain JSON on SQLite.
+Json = JSON().with_variant(JSONB(), "postgresql")
 
 
 def _now() -> datetime:
@@ -24,10 +29,10 @@ class BrandIdentity(Base):
     __tablename__ = "brand_identity"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
-    colors: Mapped[list] = mapped_column(JSON, default=list)
+    colors: Mapped[list] = mapped_column(Json, default=list)
     font_path: Mapped[str | None] = mapped_column(String(512))
     logo_path: Mapped[str | None] = mapped_column(String(512))
-    tone_samples: Mapped[list] = mapped_column(JSON, default=list)
+    tone_samples: Mapped[list] = mapped_column(Json, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
@@ -35,7 +40,7 @@ class EditBlueprint(Base):
     __tablename__ = "edit_blueprints"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    data: Mapped[dict] = mapped_column(JSON)
+    data: Mapped[dict] = mapped_column(Json)
     source_sha256: Mapped[str] = mapped_column(String(64), index=True, default="")
     origin: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -52,7 +57,7 @@ class TemplateVault(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     nickname: Mapped[str] = mapped_column(String(64))
     blueprint_id: Mapped[int] = mapped_column(ForeignKey("edit_blueprints.id"))
-    tags: Mapped[list] = mapped_column(JSON, default=list)
+    tags: Mapped[list] = mapped_column(Json, default=list)
     usage_count: Mapped[int] = mapped_column(Integer, default=0)
     avg_views: Mapped[float | None] = mapped_column(Float)  # filled by /audit once Meta is connected
     preview_path: Mapped[str | None] = mapped_column(String(512))
@@ -93,7 +98,9 @@ async def init_db() -> async_sessionmaker[AsyncSession]:
     global _engine, _sessionmaker
     if _sessionmaker is None:
         get_settings().dir()  # make sure the data dir exists for SQLite
-        _engine = create_async_engine(get_settings().db_url)
+        url = get_settings().db_url
+        kwargs = {"pool_pre_ping": True, "pool_size": 5, "max_overflow": 10} if url.startswith("postgresql") else {}
+        _engine = create_async_engine(url, **kwargs)
         async with _engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
@@ -243,3 +250,27 @@ async def add_weights(user_id: int, deltas: dict[str, float]) -> None:
                 s.add(row)
             row.value = (row.value or 0.0) + delta
         await s.commit()
+
+
+async def copy_database(source_url: str) -> dict[str, int]:
+    """Copy every row from another database (e.g. the old SQLite file) into the configured one."""
+    target = await init_db()
+    src_engine = create_async_engine(source_url)
+    counts = {}
+    try:
+        async with async_sessionmaker(src_engine)() as src, target() as dst:
+            for model in (BrandIdentity, EditBlueprint, TemplateVault, PublishedMediaFingerprint, LearningWeight):
+                rows = list(await src.scalars(select(model)))
+                for row in rows:
+                    data = {c.key: getattr(row, c.key) for c in model.__table__.columns}
+                    await dst.merge(model(**data))
+                counts[model.__tablename__] = len(rows)
+            await dst.commit()
+            if _engine is not None and _engine.dialect.name == "postgresql":
+                for model in (BrandIdentity, EditBlueprint, TemplateVault, PublishedMediaFingerprint, LearningWeight):
+                    t = model.__tablename__
+                    await dst.execute(text(f"SELECT setval(pg_get_serial_sequence('{t}', 'id'), COALESCE((SELECT MAX(id) FROM {t}), 0) + 1, false)"))
+                await dst.commit()
+    finally:
+        await src_engine.dispose()
+    return counts

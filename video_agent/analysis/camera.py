@@ -56,19 +56,25 @@ def estimate_curves(path: str | Path, bounds: list[tuple[float, float]], fps: fl
 
 
 def estimate_curves_and_blur(path: str | Path, bounds: list[tuple[float, float]], fps: float, width: int = 480) -> tuple[list[CameraCurve], float]:
-    """Curves plus the editor's motion-blur shutter (0 = none, 0.5 = 180 degrees), judged by how much
-    sharper still frames are than frames where the camera transform moves fast."""
+    """Curves plus the editor's motion-blur shutter (0 = none, 0.5 = 180°, 1.0 = 360° heavy blur).
+
+    Within each shot, the sharpness of the fastest-moving third of frames is compared with the
+    slowest third (pro edits rarely hold still, so there may be no truly still frames).
+    """
     curves, sharp = _estimate(path, bounds, fps, width)
     ratios = []
     for curve, sh in zip(curves, sharp):
         speeds = _corner_speeds(curve, width, width * 16 / 9)
         sh = np.array(sh[: len(speeds)])
-        slow, fast = sh[speeds < 1.0], sh[speeds > 8.0]
-        if len(slow) >= 3 and len(fast) >= 2:
-            ratios.append(float(np.median(fast) / (np.median(slow) + 1e-6)))
+        if len(speeds) < 6 or np.ptp(speeds) < 6:
+            continue
+        order = np.argsort(speeds)
+        k = len(speeds) // 3
+        ratios.append(float(np.median(sh[order[-k:]]) / (np.median(sh[order[:k]]) + 1e-6)))
     if not ratios:
         return curves, 0.0
-    return curves, 0.5 if float(np.median(ratios)) < 0.55 else 0.0
+    r = float(np.median(ratios))
+    return curves, 1.0 if r < 0.5 else 0.5 if r < 0.75 else 0.0
 
 
 def _corner_speeds(curve: CameraCurve, w: float, h: float) -> np.ndarray:
@@ -86,6 +92,33 @@ def _corner_speeds(curve: CameraCurve, w: float, h: float) -> np.ndarray:
     return np.concatenate([[0.0], d])
 
 
+_ECC_WIDTH = 96
+_ECC_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
+
+
+def _ecc_step(prev: np.ndarray, gray: np.ndarray) -> np.ndarray | None:
+    """3x3 transform prev -> gray from whole-image intensity alignment at low resolution."""
+    h, w = gray.shape
+    small = (_ECC_WIDTH, max(2, int(h * _ECC_WIDTH / w)))
+    a = cv2.resize(prev, small, interpolation=cv2.INTER_AREA).astype(np.float32)
+    b = cv2.resize(gray, small, interpolation=cv2.INTER_AREA).astype(np.float32)
+    try:
+        cc, warp = cv2.findTransformECC(b, a, np.eye(2, 3, dtype=np.float32), cv2.MOTION_AFFINE, _ECC_CRITERIA, None, 5)
+    except cv2.error:
+        return None
+    if cc < 0.85:
+        return None
+    fwd = np.linalg.inv(np.vstack([warp, [0, 0, 1]]))  # ECC maps gray -> prev coordinates
+    k = w / _ECC_WIDTH
+    scale = np.diag([k, k, 1.0])
+    step = scale @ fwd @ np.linalg.inv(scale)
+    z, r, x, y = _decompose(step, w, h)
+    # One frame of even the wildest edit stays within these; beyond them the fit has failed.
+    if not (0.7 <= z <= 1.45) or abs(r) > math.radians(30) or max(abs(x), abs(y)) > 0.35:
+        return None
+    return step
+
+
 class _ShotTracker:
     """Tracks the same features through a shot and fits each frame directly to the first frame.
 
@@ -100,6 +133,7 @@ class _ShotTracker:
         self.p0 = np.empty((0, 2), np.float32)
         self.cur = np.empty((0, 2), np.float32)
         self.seeded = 0
+        self.sharpness = [float(cv2.Laplacian(gray, cv2.CV_32F).var())]
         self._seed(gray)
 
     def _seed(self, gray: np.ndarray) -> None:
@@ -114,7 +148,12 @@ class _ShotTracker:
         self.seeded = len(self.cur)
 
     def update(self, gray: np.ndarray) -> np.ndarray:
-        if len(self.cur) >= 12:
+        sharp = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+        self.sharpness.append(sharp)
+        blurred = sharp < 0.35 * float(np.median(self.sharpness))
+        before = self.m.copy()
+        tracked = False
+        if len(self.cur) >= 12 and not blurred:
             nxt, st, _ = cv2.calcOpticalFlowPyrLK(self.prev, gray, self.cur.reshape(-1, 1, 2), None, **_LK)
             back, st2, _ = cv2.calcOpticalFlowPyrLK(gray, self.prev, nxt, None, **_LK)
             fb = np.linalg.norm(back.reshape(-1, 2) - self.cur, axis=1)
@@ -126,6 +165,18 @@ class _ShotTracker:
                     self.m = np.vstack([m, [0, 0, 1]])
                     keep = inl.reshape(-1).astype(bool)
                     self.p0, self.cur = self.p0[keep], self.cur[keep]
+                    tracked = True
+        if not tracked:
+            # Whip pans and zoom blurs smear features away; whole-image alignment at low
+            # resolution still sees the move.
+            step = _ecc_step(self.prev, gray)
+            if step is not None and not 0.25 <= _decompose(step @ before, *gray.shape[::-1])[0] <= 4.0:
+                step = None  # a run of blurred frames compounding into an impossible zoom: hold instead
+            if step is not None:
+                self.m = step @ before
+                self.p0 = np.empty((0, 2), np.float32)
+                self.cur = np.empty((0, 2), np.float32)
+                self.seeded = 0
         self.prev = gray
         if len(self.cur) < max(60, 0.4 * self.seeded):
             self._seed(gray)
@@ -133,33 +184,43 @@ class _ShotTracker:
 
 
 def _estimate(path, bounds, fps, width):
-    curves = [CameraCurve(fps=fps) for _ in bounds]
-    sharp: list[list[float]] = [[] for _ in bounds]
-    shot = -1
-    tracker = None
-    lum_prev = None
+    """Per shot: transforms measured from the shot's sharpest frame, tracking forwards and backwards.
+
+    Anchoring on the first frame let a blurred transition frame at the start of a shot (the tail of
+    the previous whip) spoil every measurement after it; from the sharpest frame a bad frame can
+    only spoil itself.
+    """
+    frames: list[list[np.ndarray]] = [[] for _ in bounds]
     for t, frame in iter_frames(path, sample_fps=fps, width=width):
         idx = next((i for i, (a, b) in enumerate(bounds) if a - 0.5 / fps <= t < b - 0.5 / fps), None)
-        if idx is None:
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        lum = float(gray.mean())
-        if idx != shot:
-            shot, tracker = idx, _ShotTracker(gray)
-            cum = np.eye(3)
-        elif lum_prev is not None and abs(lum - lum_prev) > 40:
-            cum = tracker.m  # flash frame: hold the last transform, keep tracking from the last good frame
-        else:
-            cum = tracker.update(gray)
-        h, w = gray.shape
-        s, r, x, y = _decompose(cum, w, h)
-        c = curves[shot]
-        c.s.append(round(s, 5))
-        c.r.append(round(r, 5))
-        c.x.append(round(x, 5))
-        c.y.append(round(y, 5))
-        sharp[shot].append(float(cv2.Laplacian(gray, cv2.CV_32F).var()))
-        lum_prev = lum
+        if idx is not None:
+            frames[idx].append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+    curves, sharp = [], []
+    for shot in frames:
+        sharpness = [float(cv2.Laplacian(g, cv2.CV_32F).var()) for g in shot]
+        curve = CameraCurve(fps=fps)
+        if shot:
+            key = int(np.argmax(sharpness))
+            mats = [None] * len(shot)
+            mats[key] = np.eye(3)
+            for order in (range(key + 1, len(shot)), range(key - 1, -1, -1)):
+                tracker, prev_lum = _ShotTracker(shot[key]), float(shot[key].mean())
+                for i in order:
+                    lum = float(shot[i].mean())
+                    # flash frames: hold the last transform, keep tracking from the last good frame
+                    mats[i] = tracker.m if abs(lum - prev_lum) > 40 else tracker.update(shot[i])
+                    prev_lum = lum
+            # Express relative to the first frame, as the rest of the pipeline expects.
+            first_inv = np.linalg.inv(mats[0])
+            h, w = shot[0].shape
+            for m in mats:
+                sc, r, x, y = _decompose(m @ first_inv, w, h)
+                curve.s.append(round(sc, 5))
+                curve.r.append(round(r, 5))
+                curve.x.append(round(x, 5))
+                curve.y.append(round(y, 5))
+        curves.append(curve)
+        sharp.append(sharpness)
     return curves, sharp
 
 
@@ -214,11 +275,12 @@ def motion_velocities(path: str | Path, bounds: list[tuple[float, float]], fps: 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if idx == shot and prev is not None:
             m = frame_motion(prev, gray)
-            if m is None:
+            step = np.vstack([m, [0, 0, 1]]) if m is not None else _ecc_step(prev, gray)  # blurred frames: whole-image fallback
+            if step is None:
                 out[idx].append((np.nan,) * 4)
             else:
                 h, w = gray.shape
-                s, r, x, y = _decompose(np.vstack([m, [0, 0, 1]]), w, h)
+                s, r, x, y = _decompose(step, w, h)
                 out[idx].append((math.log(max(s, 1e-3)), r, x, y))
         shot, prev = idx, gray
     return [np.array(v, dtype=np.float64).reshape(-1, 4) for v in out]

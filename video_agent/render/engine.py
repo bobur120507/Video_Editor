@@ -14,6 +14,9 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 from ..blueprint import Blueprint, ColorProfile, TextOverlay
 from ..config import get_settings
 from ..director import CONTENT_MATCH, EditPlan, Shot
@@ -167,7 +170,23 @@ def _render_shot(shot: Shot, bp: Blueprint, opts: RenderOptions, fps: int, n_fra
     graded = tmp / f"{dst.stem}_graded.mp4" if camera else dst
     ffmpeg([*SWS_FLAGS, "-i", base, "-vf", ",".join(post), "-frames:v", n_frames, "-an", *LOSSLESS, "-r", fps, graded])
     if camera:
-        apply_camera(graded, dst, camera, W, H, fps, n_frames, bp.motion_blur, LOSSLESS, absolute=absolute)
+        shutter = bp.motion_blur
+        if absolute and shutter and _already_blurred(base, reference, seg.start, n_frames, fps):
+            shutter = 0.0  # the footage already carries the editor's blur (it is an edited video, not raw)
+        apply_camera(graded, dst, camera, W, H, fps, n_frames, shutter, LOSSLESS, absolute=absolute)
+
+
+def _already_blurred(footage: Path, reference: Path, ref_start: float, n_frames: int, fps: int) -> bool:
+    """True when the footage is no sharper than the reference at the same moments."""
+    ratios = []
+    for i in np.linspace(0, n_frames - 1, min(8, n_frames)).round().astype(int):
+        a, b = frame_at(footage, i / fps, width=360), frame_at(reference, ref_start + i / fps, width=360)
+        if a is None or b is None:
+            continue
+        sa = cv2.Laplacian(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), cv2.CV_32F).var()
+        sb = cv2.Laplacian(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), cv2.CV_32F).var()
+        ratios.append(sa / (sb + 1e-6))
+    return bool(ratios) and float(np.median(ratios)) < 1.5
 
 
 def _shot_lut(shot: Shot, bp: Blueprint, base: Path, stats: dict, target: ColorProfile, opts: RenderOptions, fps: int, path: Path) -> Path | None:
@@ -204,7 +223,10 @@ def _plan_pieces(seg, stretch: float, fps: int, n_frames: int) -> list[tuple[flo
 
 
 def _render_piece(shot: Shot, start: float, src_len: float, speed: float, n_out: int, framing: list[str], fps: int, opts: RenderOptions, dst: Path, tmp: Path) -> None:
-    src = ["-ss", f"{start:.4f}", "-t", f"{src_len + 0.25:.4f}", "-i", shot.clip.path]
+    # Seek half a frame early: start times are rounded (1.167 s for frame 35 = 1.1667 s), and
+    # seeking exactly there would skip to the next frame and put the whole shot one frame early.
+    half = 0.5 / (shot.clip.probe.fps or fps)
+    src = ["-ss", f"{max(0.0, start - half):.4f}", "-t", f"{src_len + 0.25 + half:.4f}", "-i", shot.clip.path]
     if speed < 0.95 and opts.interpolate_slowmo and rife_binary():
         try:
             _rife_piece(src, framing, n_out, fps, dst, tmp)

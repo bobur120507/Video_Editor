@@ -11,7 +11,7 @@ import numpy as np
 
 from .blueprint import Blueprint, Segment
 from .analysis.visual import detect_cuts
-from .media import Probe, color_stats, iter_frames, probe, thumb
+from .media import Probe, color_stats, frame_at, iter_frames, probe, thumb
 
 log = logging.getLogger(__name__)
 
@@ -103,34 +103,32 @@ def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
     if have < needed:
         warnings.append(f"Footage is {have:.1f}s but the template needs {needed:.1f}s; some footage will be reused.")
 
-    cursor = {id(c): 0.0 for c in clips}
     shots: list[Shot] = []
-    prev_clip = None
+    used: dict[tuple[int, int], int] = {}  # (clip, source shot) -> times used
+    used_ranges: list[tuple[int, float, float]] = []
+    prev_key = None
     for seg in blueprint.segments:
         need = seg.source_seconds_needed()
-        found = _content_window(seg, clips, need)
+        found = _content_window(seg, clips, need, blueprint.source.path)
         if found:
             clip, start, corr = found
             length = min(need, clip.duration - start)
-            cursor[id(clip)] = max(cursor[id(clip)], start + length)
-            prev_clip = clip
             shots.append(Shot(segment=seg, clip=clip, src_start=start, src_len=length, stretch=need / length, content_match=corr))
             continue
         best = None
-        for c in clips:
-            start, reuse = _skip_cuts(c, cursor[id(c)], need), False
-            if start is None or start + need > c.duration:
-                start, reuse = _best_window(c, need, seg.motion), True
-            length = min(need, c.duration - start)
-            score = -abs(c.motion_between(start, start + length) - seg.motion)
-            score -= 0.5 if reuse else 0.0
-            score -= 0.3 if c is prev_clip and len(clips) > 1 else 0.0
-            score -= 0.4 * max(0.0, 1 - length / need)
-            if best is None or score > best[0]:
-                best = (score, c, start, length)
-        _, clip, start, length = best
-        cursor[id(clip)] = max(cursor[id(clip)], start + length)
-        prev_clip = clip
+        for ci, c in enumerate(clips):
+            for start, end, key_shot, score in _rank_windows(seg, c, need):
+                key = (ci, key_shot)
+                score -= 0.6 if key == prev_key else 0.0  # never the same camera angle twice in a row
+                score -= 0.25 * used.get(key, 0)  # spread the edit over every angle
+                score -= 0.3 if any(u == ci and start < b and a < end for u, a, b in used_ranges) else 0.0
+                if best is None or score > best[0]:
+                    best = (score, c, start, end, key)
+        _, clip, start, end, key = best
+        used[key] = used.get(key, 0) + 1
+        used_ranges.append((key[0], start, end))
+        prev_key = key
+        length = end - start
         shots.append(Shot(segment=seg, clip=clip, src_start=start, src_len=length, stretch=need / length))
 
     for shot in shots:
@@ -140,7 +138,7 @@ def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
     return EditPlan(shots=shots, warnings=warnings, missing=missing)
 
 
-def _content_window(seg: Segment, clips: list[ClipInfo], need: float) -> tuple[ClipInfo, float, float] | None:
+def _content_window(seg: Segment, clips: list[ClipInfo], need: float, reference: str = "") -> tuple[ClipInfo, float, float] | None:
     """If a clip contains the reference shot's own picture, return (clip, source start, correlation).
 
     The whole shot is aligned as a sequence (several frames at their relative times), so still or
@@ -164,15 +162,93 @@ def _content_window(seg: Segment, clips: list[ClipInfo], need: float) -> tuple[C
             continue
         corr = np.einsum("nzd,kd->knz", c.thumbs, refs)  # (k, N, zooms)
         starts = np.arange(n - span + 1)
-        score = np.mean([corr[i, starts + o] for i, o in enumerate(offs)], axis=0)  # (starts, zooms)
-        score = score.max(axis=1) + 0.03 * c.cut_after[starts]
+        per_zoom = np.mean([corr[i, starts + o] for i, o in enumerate(offs)], axis=0)  # (starts, zooms)
+        score = per_zoom.max(axis=1) + 0.03 * c.cut_after[starts]
         j = int(np.argmax(score))
         if best is None or score[j] > best[2]:
-            best = (c, float(c.times[j]), float(score[j]))
+            best = (c, float(c.times[j]), float(score[j]), THUMB_ZOOMS[int(np.argmax(per_zoom[j]))])
     if best is None or best[2] < CONTENT_MATCH:
         return None
-    clip, start, corr = best
-    return clip, min(max(0.0, start), max(0.0, clip.duration - need)), min(1.0, corr)
+    clip, start, corr, zoom = best
+    start = min(max(0.0, start), max(0.0, clip.duration - need))
+    # Similar framing (car centred, sky above) also correlates highly; only call it the same footage
+    # when the actual picture details line up geometrically.
+    k = len(seg.thumbs_t) // 2 if seg.thumbs_t else 0
+    t_rel = seg.thumbs_t[k] if seg.thumbs_t else seg.thumb_t
+    if not _same_picture(reference, seg.start + t_rel, clip.path, start + seg.source_offset(t_rel), strict=not reference, zoom=zoom):
+        return None
+    return clip, start, min(1.0, corr)
+
+
+def _same_picture(reference: str, ref_t: float, clip: Path, clip_t: float, strict: bool, zoom: float = 1.0) -> bool:
+    if strict or not reference or not Path(reference).exists():
+        return False  # without the reference file we cannot verify: treat as different footage
+    a, b = frame_at(reference, ref_t, width=480), frame_at(clip, clip_t, width=480)
+    if a is None or b is None:
+        return False
+    ga, gb = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
+    orb = cv2.ORB_create(2000)
+    ka, da = orb.detectAndCompute(ga, None)
+    kb, db = orb.detectAndCompute(gb, None)
+    if da is None or db is None or len(ka) < 50 or len(kb) < 50:
+        # Flat pictures (graphics, sky, smooth walls) have too few feature points; compare the
+        # whole image instead. Same footage aligns at >= 0.95, different scenes stay below.
+        try:
+            h, w = ga.shape
+            # Start from the zoom the thumbnails matched at (reference frame = footage zoomed in).
+            init = np.array([[1 / zoom, 0, w / 2 * (1 - 1 / zoom)], [0, 1 / zoom, h / 2 * (1 - 1 / zoom)]], np.float32)
+            cc, _ = cv2.findTransformECC(ga.astype(np.float32), gb.astype(np.float32), init, cv2.MOTION_AFFINE,
+                                         (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5), None, 5)
+        except cv2.error:
+            return False
+        return cc >= 0.95
+    pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(da, db, k=2)
+    good = [m for m, *rest in (p for p in pairs if len(p) == 2) if m.distance < 0.75 * rest[0].distance]
+    if len(good) < 25:
+        return False
+    pa = np.float32([ka[m.queryIdx].pt for m in good])
+    pb = np.float32([kb[m.trainIdx].pt for m in good])
+    _, inliers = cv2.estimateAffinePartial2D(pa, pb, method=cv2.RANSAC, ransacReprojThreshold=4.0)
+    return inliers is not None and int(inliers.sum()) >= 25 and inliers.mean() > 0.35
+
+
+def _rank_windows(seg: Segment, clip: ClipInfo, need: float) -> list[tuple[float, float, int, float]]:
+    """Candidate source windows as (start, end, source-shot index, score).
+
+    Score = framing similarity to the reference shot (wide vs close-up, where the subject sits)
+    minus motion mismatch. Windows that would cross a cut in the footage are shortened to the
+    shot and penalised for it.
+    """
+    n, fps = len(clip.thumbs), clip.probe.fps
+    if n == 0:
+        return [(0.0, min(need, clip.duration), 0, -1.0)]
+    shot_id = np.cumsum(clip.cut_after) - 1
+    shot_end = np.empty(n)
+    for sid in np.unique(shot_id):
+        idx = np.where(shot_id == sid)[0]
+        shot_end[idx] = clip.times[idx[-1]] + 1 / fps
+    span = max(1, int(round(need * fps)))
+    starts = np.arange(0, max(1, n - min(span, n - 1)), max(1, int(fps // 10)))
+    if seg.thumbs:
+        refs = np.array(seg.thumbs, dtype=np.float32)
+        offs = np.minimum(np.round(np.array([seg.source_offset(t) for t in seg.thumbs_t]) * fps).astype(int), span - 1)
+        corr = np.einsum("nzd,kd->knz", clip.thumbs, refs)
+        framing = np.mean([corr[i, np.minimum(starts + o, n - 1)] for i, o in enumerate(offs)], axis=0).max(axis=1)
+    else:
+        framing = np.zeros(len(starts))
+    cum = np.concatenate([[0.0], np.cumsum(clip.motion)])
+    out = []
+    for j, st in enumerate(starts):
+        t0 = float(clip.times[st])
+        end = min(t0 + need, float(shot_end[st]))
+        length = end - t0
+        if length < min(need, 0.15):
+            continue
+        e = min(n, st + span)
+        motion = (cum[e] - cum[st]) / max(1, e - st)
+        score = float(framing[j]) - abs(motion - seg.motion) - 0.8 * max(0.0, 1 - length / need)
+        out.append((t0, end, int(shot_id[st]), score))
+    return out or [(0.0, min(need, clip.duration), 0, -1.0)]
 
 
 def _best_window(clip: ClipInfo, need: float, target_motion: float) -> float:

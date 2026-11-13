@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 
 from ..blueprint import ColorProfile
+from ..media import orb_init as _orb_init
 
 log = logging.getLogger(__name__)
 
@@ -117,19 +118,3 @@ def transfer_lut(src: dict, target: ColorProfile, strength: float, path: Path) -
     lab = lab + (moved - lab) * amount
     out = cv2.cvtColor(lab[None].astype(np.float32), cv2.COLOR_LAB2BGR)[0][:, ::-1]
     return write_cube(path, out)
-
-
-def _orb_init(src_gray: np.ndarray, ref_gray: np.ndarray) -> np.ndarray:
-    """Rough src->ref similarity from ORB matches (handles big zooms ECC can't start from)."""
-    orb = cv2.ORB_create(1500)
-    k1, d1 = orb.detectAndCompute(ref_gray, None)
-    k2, d2 = orb.detectAndCompute(src_gray, None)
-    if d1 is None or d2 is None or len(k1) < 10 or len(k2) < 10:
-        return np.eye(2, 3, dtype=np.float32)
-    matches = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(d1, d2)
-    if len(matches) < 10:
-        return np.eye(2, 3, dtype=np.float32)
-    ref_pts = np.float32([k1[m.queryIdx].pt for m in matches])
-    src_pts = np.float32([k2[m.trainIdx].pt for m in matches])
-    m, _ = cv2.estimateAffinePartial2D(ref_pts, src_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
-    return m.astype(np.float32) if m is not None else np.eye(2, 3, dtype=np.float32)

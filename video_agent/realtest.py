@@ -8,6 +8,7 @@ Folder layout (default data/real/):
       car_phonk_1/
         reference.mp4           the finished edit (any single video file in the folder works)
         raw/                    optional: the raw clips that edit was made from -> exact pixel test
+        <any other folder>/     optional: footage to edit in this Reel's style (e.g. source_video_for_edit/)
 
 For every case: clone the reference, re-edit it (from raw/ if present, and from _footage/ if present),
 score it, and save a side-by-side contact sheet so you can judge it by eye.
@@ -83,7 +84,15 @@ def contact_sheet(reference: Path, outputs: dict[str, Path], dst: Path, n: int =
     return dst
 
 
-def run(root: Path | None = None) -> tuple[list[dict], list[str]]:
+def _case_footage(case: Path) -> list[Path]:
+    """Footage given for this Reel specifically: any subfolder with videos other than raw/ and _results/."""
+    for sub in sorted(case.iterdir()):
+        if sub.is_dir() and sub.name not in ("raw", "_results") and _videos(sub):
+            return _videos(sub)
+    return []
+
+
+def run(root: Path | None = None, cross: bool = False) -> tuple[list[dict], list[str]]:
     root = Path(root or get_settings().dir("real"))
     errors = fetch_links(root)
     footage = _videos(root / "_footage")
@@ -92,8 +101,13 @@ def run(root: Path | None = None) -> tuple[list[dict], list[str]]:
     for case in cases:
         reference = _videos(case)[0]
         # No footage folder: cross-apply, i.e. edit this style onto the other Reels' footage.
-        others = [_videos(c)[0] for c in cases if c != case]
-        test_footage, footage_label = (footage, "your footage") if footage else (others, "other reels' footage")
+        # Different-footage test: this Reel's own footage folder, else _footage/, else (only with
+        # cross=True) the other Reels — which is only meaningful when they are the same kind of edit.
+        own = _case_footage(case)
+        others = [_videos(c)[0] for c in cases if c != case] if cross else []
+        test_footage, footage_label = (
+            (own, "your footage") if own else (footage, "your footage") if footage else (others, "other reels' footage")
+        )
         out_dir = case / "_results"
         out_dir.mkdir(exist_ok=True)
         t0 = time.time()

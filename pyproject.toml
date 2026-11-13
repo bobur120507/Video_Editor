@@ -8,7 +8,8 @@ dependencies = [
     "pydantic>=2.13",
     "pydantic-settings>=2.6",
     "sqlalchemy[asyncio]>=2.1",
-    "aiosqlite>=0.20",
+    "asyncpg>=0.30",  # PostgreSQL (main database)
+    "aiosqlite>=0.20",  # SQLite fallback for tests / no DATABASE_URL
     "redis>=5.0",
     "librosa>=1.0",
     "opencv-python>=4.10,<5",  # same package scenedetect needs; 5.x dropped Haar cascades
@@ -22,7 +23,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-postgres = ["asyncpg>=0.30"]
 dev = ["pytest>=8", "pytest-asyncio>=0.24"]
 
 [project.scripts]

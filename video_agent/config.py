@@ -43,6 +43,7 @@ class Settings(BaseSettings):
 
     @property
     def db_url(self) -> str:
+        """PostgreSQL via DATABASE_URL (recommended). Without it, a local SQLite file so tests and quick trials still run."""
         return self.database_url or f"sqlite+aiosqlite:///{(self.data_dir / 'video_agent.db').resolve()}"
 
     def dir(self, *parts: str) -> Path:

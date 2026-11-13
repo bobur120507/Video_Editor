@@ -20,7 +20,7 @@ from ..blueprint import CameraCurve
 log = logging.getLogger(__name__)
 
 MAX_COVER_ZOOM = 1.8
-MAX_BLUR_SAMPLES = 12
+MAX_BLUR_SAMPLES = 24
 
 
 def is_static(curve: CameraCurve | None) -> bool:

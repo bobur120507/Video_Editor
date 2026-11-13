@@ -14,6 +14,24 @@ cp .env.example .env   # then fill in TELEGRAM_BOT_TOKEN and any LLM keys
 
 FFmpeg must be on PATH (`sudo apt install ffmpeg`).
 
+### Database (PostgreSQL)
+
+Create a role and database once (pick your own password):
+
+```bash
+sudo -u postgres psql -c "CREATE ROLE video_agent LOGIN PASSWORD 'your-password';"
+sudo -u postgres createdb -O video_agent video_agent
+```
+
+Then in `.env`:
+
+```
+DATABASE_URL=postgresql+asyncpg://video_agent:your-password@localhost:5432/video_agent
+```
+
+Tables are created on first start. To bring over data from the earlier SQLite file: `.venv/bin/video-agent migrate-db`.
+Video files are never stored in the database; they stay under `data/`.
+
 ## Use it
 
 Telegram:
@@ -67,7 +85,7 @@ apply:  Blueprint + clips ─► AI Director (motion-matched clip windows, face-
 | `video_agent/scoring.py` / `bench.py` | Match score and the ground-truth benchmark |
 | `video_agent/tweak.py` | Natural-language feedback to blueprint changes, logged to `Learning_Weights` |
 | `video_agent/llm.py` | Hybrid LLM: Claude, OpenRouter, Gemini, OpenAI, tried in `LLM_PROVIDERS` order with fallback |
-| `video_agent/storage.py` | `Brand_Identity`, `Edit_Blueprints`, `Template_Vault`, `Published_Media_Fingerprints`, `Learning_Weights` (SQLite by default, PostgreSQL via `DATABASE_URL`) |
+| `video_agent/storage.py` | `Brand_Identity`, `Edit_Blueprints`, `Template_Vault`, `Published_Media_Fingerprints`, `Learning_Weights` (PostgreSQL with JSONB; SQLite fallback) |
 | `video_agent/meta.py` | Placeholder for every Instagram Graph API feature |
 
 ### After Effects replacement (hybrid render tiers)

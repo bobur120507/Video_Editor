@@ -91,7 +91,7 @@ async def cmd_realtest(args) -> None:
     from .realtest import run
 
     print("Testing real Reels (each takes a few minutes)…")
-    results, errors = await asyncio.to_thread(run, Path(args.dir) if args.dir else None)
+    results, errors = await asyncio.to_thread(run, Path(args.dir) if args.dir else None, args.cross)
     root = Path(args.dir) if args.dir else get_settings().dir("real")
     if not results:
         print(f"No cases found. Put each Reel in its own folder under {root}/ (see {root}/HOW_TO.txt)")
@@ -104,6 +104,15 @@ async def cmd_realtest(args) -> None:
     for e in errors:
         print(f"download error: {e}")
     print(f"\nFull report with side-by-side frames: {root / 'REPORT.md'}")
+
+
+async def cmd_migrate_db(args) -> None:
+    target = get_settings().db_url
+    if not target.startswith("postgresql"):
+        sys.exit("Set DATABASE_URL in .env to your PostgreSQL database first.")
+    source = args.source or f"sqlite+aiosqlite:///{(get_settings().data_dir / 'video_agent.db').resolve()}"
+    counts = await storage.copy_database(source)
+    print("Copied: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
 
 
 async def cmd_show(args) -> None:
@@ -157,7 +166,12 @@ def main() -> None:
 
     p = sub.add_parser("realtest", help="Clone, re-edit and score real Reels from data/real/")
     p.add_argument("--dir", help="Test folder (default: data/real)")
+    p.add_argument("--cross", action="store_true", help="Also apply each Reel's style to the other Reels (only for Reels of the same kind)")
     p.set_defaults(fn=cmd_realtest)
+
+    p = sub.add_parser("migrate-db", help="Copy the old SQLite data into PostgreSQL (DATABASE_URL)")
+    p.add_argument("--source", help="Source database URL (default: data/video_agent.db)")
+    p.set_defaults(fn=cmd_migrate_db)
 
     sub.add_parser("bot", help="Run the Telegram bot")
 

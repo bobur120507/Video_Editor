@@ -211,3 +211,19 @@ def thumb(frame: np.ndarray, aspect: float = 9 / 16, size: int = 16, zoom: float
     g -= g.mean()
     n = float(np.linalg.norm(g))
     return (g / n).reshape(-1) if n > 1e-6 else g.reshape(-1)
+
+
+def orb_init(src_gray: np.ndarray, ref_gray: np.ndarray) -> np.ndarray:
+    """Rough src->ref similarity from ORB matches (handles big zooms ECC can't start from)."""
+    orb = cv2.ORB_create(1500)
+    k1, d1 = orb.detectAndCompute(ref_gray, None)
+    k2, d2 = orb.detectAndCompute(src_gray, None)
+    if d1 is None or d2 is None or len(k1) < 10 or len(k2) < 10:
+        return np.eye(2, 3, dtype=np.float32)
+    matches = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(d1, d2)
+    if len(matches) < 10:
+        return np.eye(2, 3, dtype=np.float32)
+    ref_pts = np.float32([k1[m.queryIdx].pt for m in matches])
+    src_pts = np.float32([k2[m.trainIdx].pt for m in matches])
+    m, _ = cv2.estimateAffinePartial2D(ref_pts, src_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+    return m.astype(np.float32) if m is not None else np.eye(2, 3, dtype=np.float32)

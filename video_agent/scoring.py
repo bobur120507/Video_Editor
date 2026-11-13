@@ -73,12 +73,15 @@ def _camera_score(ref_vel: list[np.ndarray], out_vel: list[np.ndarray]) -> float
         n = min(len(a), len(b))
         if n == 0:
             continue
-        a, b = np.nan_to_num(a[:n]), np.nan_to_num(b[:n])
+        a, b = a[:n], b[:n]
+        known = ~(np.isnan(a).any(axis=1) | np.isnan(b).any(axis=1))  # frames neither tracker could read are skipped
+        a, b = np.nan_to_num(a), np.nan_to_num(b)
         if n >= 5:
             a = np.stack([np.convolve(a[:, c], k, "same") for c in range(4)], axis=1)
             b = np.stack([np.convolve(b[:, c], k, "same") for c in range(4)], axis=1)
-        e = np.abs(a - b) / tol
-        scores += [closeness(float(v)) for v in e.sum(axis=1)]
+        # Tolerance grows with the size of the move: a 2% miss on a 30%-per-frame whip zoom is invisible.
+        e = np.abs(a - b) / (tol + 0.25 * np.abs(a))
+        scores += [closeness(float(v)) for v in e[known].sum(axis=1)]
     return float(np.mean(scores)) if scores else 1.0
 
 
