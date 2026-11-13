@@ -6,13 +6,16 @@ import logging
 import tempfile
 from pathlib import Path
 
+import cv2
 import numpy as np
 
-from ..blueprint import AudioInfo, Blueprint, ColorProfile, HookInfo, OutputSpec, Segment, SourceInfo, SpeedPoint
+from .. import vision
+from ..blueprint import AudioInfo, Blueprint, ColorProfile, HookInfo, OutputSpec, Segment, SourceInfo, SpeedPoint, Subject
 from ..config import get_settings
 from ..media import color_stats, constant_fps_copy, extract_audio, ffmpeg, iter_frames, probe, sha256_file, thumb
 from .audio import analyze_audio
 from .camera import estimate_curves_and_blur
+from .events import detect_hits, extract_events
 from .visual import detect_cuts, find_flashes, flash_aware_cuts, flash_length, segment_features, track_frames
 
 log = logging.getLogger(__name__)
@@ -32,7 +35,8 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
         with tempfile.TemporaryDirectory() as tmp:
             wav = extract_audio(path, Path(tmp) / "a.wav")
             res = analyze_audio(wav)
-        audio = AudioInfo(bpm=res.bpm, beats=res.beats, drops=res.drops, has_music=res.has_music)
+            hits = detect_hits(wav) if res.has_music else []
+        audio = AudioInfo(bpm=res.bpm, beats=res.beats, drops=res.drops, hits=hits, has_music=res.has_music)
         if res.has_music:
             track = settings.dir("tracks") / f"{digest[:16]}.m4a"
             if not track.exists():
@@ -91,6 +95,13 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
             seg.thumbs = [[round(float(v), 3) for v in thumb(shot[i][1])] for i in pick]
             seg.thumbs_t = [round(shot[i][0] - seg.start, 4) for i in pick]
 
+    for seg in segments:
+        seg.events = extract_events(seg, audio.hits)
+    if vision.available():
+        _describe_shots(segments, frames)
+    else:
+        notes.append("Vision models missing (tools/models); framing and shot matching use simpler cues.")
+
     hook = _hook(segments, track, flashes)
     tier = "pro" if any(s.is_slowmo for s in segments) else "standard"
     notes.append("Speed changes and effects are detected heuristically; tweak them after the first render.")
@@ -115,6 +126,26 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
         motion_blur=shutter,
         notes=notes,
     )
+
+
+def _sharpest(frames: list, k: int = 3) -> list:
+    if len(frames) <= k:
+        return frames
+    sharp = [cv2.Laplacian(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), cv2.CV_32F).var() for f in frames]
+    return [frames[i] for i in sorted(np.argsort(sharp)[-k:])]
+
+
+def _describe_shots(segments: list[Segment], frames: list) -> None:
+    """Subject box and CLIP embedding per shot, from its sharpest frames (whip blur says nothing)."""
+    for seg in segments:
+        shot = _sharpest([f for t, f in frames if seg.start <= t < seg.end])
+        if not shot:
+            continue
+        subj = vision.main_subject(shot)
+        if subj:
+            seg.subject = Subject(cls=subj.cls, cx=round(subj.cx, 4), cy=round(subj.cy, 4), w=round(subj.w, 4), h=round(subj.h, 4))
+        emb = vision.embed_images(shot).mean(axis=0)
+        seg.clip = [round(float(v), 4) for v in emb / np.linalg.norm(emb)]
 
 
 def output_for(width: int, height: int) -> OutputSpec:

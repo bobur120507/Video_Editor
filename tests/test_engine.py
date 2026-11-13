@@ -147,3 +147,49 @@ def test_black_and_white_look_fully_desaturates(tmp_path):
     rgb = np.loadtxt(path, skiprows=1)
     mid = rgb[np.abs(_grid() - 0.5).max(axis=1) < 0.3]  # ignore extreme corners of the cube
     assert np.abs(mid - mid.mean(axis=1, keepdims=True)).max() < 0.06  # R≈G≈B: grey
+
+
+def test_events_snap_punches_to_hits_and_cap_push():
+    from video_agent.analysis.events import extract_events
+    from video_agent.blueprint import CameraCurve
+
+    n = 30
+    s = [1.0] * n
+    s[15] = 1.2  # one zoom spike inside the shot
+    for i in range(16, n):
+        s[i] = 1.2
+    curve = CameraCurve(fps=30, s=s, r=[0.0] * n, x=[0.0] * n, y=[0.0] * n)
+    seg = Segment(start=10.0, end=11.0, camera=curve)
+    events = extract_events(seg, hits=[10.52])
+    punches = [e for e in events if e.kind == "punch"]
+    assert len(punches) == 1 and punches[0].t == pytest.approx(0.52)  # moved onto the hit
+    assert not extract_events(seg, hits=[12.0]) or all(e.kind != "punch" for e in extract_events(seg, hits=[12.0]))
+
+
+def test_synthesized_whip_and_reframe_put_subject_in_place():
+    import numpy as np
+
+    from video_agent.blueprint import EditEvent, Subject
+    from video_agent.render.motion import _matrix, reframe, synthesize
+    from video_agent.vision import Box
+
+    curve, whip = synthesize([EditEvent(kind="whip_out", t=1.0, strength=1.0, dx=1.0)], 30, 30)
+    assert whip[-3:].all() and not whip[:-3].any()
+    assert curve.x[-1] > 0.3 and abs(curve.x[0]) < 1e-9  # smears out at the end only
+
+    still, _ = synthesize([], 1, 30)
+    out = reframe(still, Subject(cls="car", cx=0.4, cy=0.6, w=0.7, h=0.3), Box("car", 0.9, 0.4, 0.55, 0.6, 0.7), 1080, 1920)
+    p = _matrix(out.s[0], out.r[0], out.x[0], out.y[0], 1080, 1920) @ np.array([540, 1200, 1])
+    assert (p[0] / 1080, p[1] / 1920) == pytest.approx((0.4, 0.6), abs=1e-3)
+
+
+@pytest.mark.skipif(not __import__("video_agent.vision", fromlist=["available"]).available(), reason="vision models not installed")
+def test_vision_models_find_a_car_and_describe_it(samples):
+    import numpy as np
+
+    from video_agent import vision
+
+    texts = vision.embed_texts(["a sports car on a road", "a bowl of soup"])
+    assert texts.shape == (2, 512) and np.allclose(np.linalg.norm(texts, axis=1), 1, atol=1e-3)
+    frame = np.full((640, 360, 3), 128, np.uint8)
+    assert vision.detect(frame) == []  # nothing to find in a flat grey frame

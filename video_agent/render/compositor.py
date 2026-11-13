@@ -59,11 +59,13 @@ def relative_curve(target: CameraCurve, footage: CameraCurve | None, n_frames: i
 
 
 def _params(curve: CameraCurve, n_frames: int, fps: float) -> np.ndarray:
-    """(n_frames, 4) array of scale, rotation, x, y for the output frames, framed so motion is centred."""
+    """(n_frames, 4) array of scale, rotation, x, y for the output frames, centred on the typical framing."""
     p = np.array([curve.at(i / fps) for i in range(n_frames)], dtype=np.float64)
-    p[:, 0] /= p[:, 0].min()
+    # Centre on the shot's typical framing (median), not the middle of its range: one wild
+    # blurred frame must not tilt or zoom the whole shot. The cover zoom hides any border.
+    p[:, 0] /= np.median(p[:, 0])
     for col in (1, 2, 3):
-        p[:, col] -= (p[:, col].min() + p[:, col].max()) / 2
+        p[:, col] -= np.median(p[:, col])
     return p
 
 
@@ -102,14 +104,21 @@ def _warp_planes(planes: list[np.ndarray], m: np.ndarray, w: int, h: int) -> lis
     ]
 
 
-def apply_camera(src: Path, dst: Path, curve: CameraCurve, width: int, height: int, fps: int, n_frames: int, shutter: float, encode_args: list, absolute: bool = False) -> None:
-    """absolute=True: the curve is an exact per-frame registration, applied as is (no re-centring or cover zoom)."""
+def apply_camera(src: Path, dst: Path, curve: CameraCurve, width: int, height: int, fps: int, n_frames: int, shutter: float,
+                 encode_args: list, absolute: bool = False, mirror_ok: np.ndarray | None = None, centre: bool = True) -> None:
+    """absolute=True: the curve is an exact per-frame registration, applied as is (no re-centring or cover zoom).
+
+    mirror_ok marks frames allowed to show mirrored edges (whip frames, hidden by motion blur, like
+    After Effects' Motion Tile); they are left out of the cover-zoom calculation.
+    centre=False keeps a synthesized curve's framing as designed.
+    """
     if absolute:
         p = np.array([curve.at(i / fps) for i in range(n_frames)], dtype=np.float64)
         k = 1.0
     else:
-        p = _params(curve, n_frames, fps)
-        k = _cover_zoom(p, width, height)
+        p = _params(curve, n_frames, fps) if centre else np.array([curve.at(i / fps) for i in range(n_frames)], dtype=np.float64)
+        keep = ~mirror_ok[:n_frames] if mirror_ok is not None and (~mirror_ok[:n_frames]).any() else np.ones(n_frames, bool)
+        k = _cover_zoom(p[keep], width, height)
     idx = np.arange(n_frames, dtype=np.float64)
 
     def at(f: float) -> np.ndarray:

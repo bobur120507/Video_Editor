@@ -82,6 +82,9 @@ apply:  Blueprint + clips ─► AI Director (motion-matched clip windows, face-
 | `video_agent/render/compositor.py` | Keyframe compositor: replays that motion on new footage (minus the footage's own motion), cover zoom, motion blur |
 | `video_agent/render/grade.py` | Colour as 3D LUTs: fitted from aligned frames when the footage is the reference's own, Lab look transfer otherwise |
 | `video_agent/render/rife.py` | RIFE AI frame interpolation for slow motion (Vulkan, runs on the Intel GPU) |
+| `video_agent/analysis/events.py` | Edit moves per shot (whips, punches, shakes, push) and the music hits they sit on |
+| `video_agent/render/motion.py` | Re-creates those moves on new footage, framed and aimed at the subject |
+| `video_agent/vision.py` | YOLOX subject detection and CLIP shot understanding (ONNX, CPU) |
 | `video_agent/scoring.py` / `bench.py` | Match score and the ground-truth benchmark |
 | `video_agent/tweak.py` | Natural-language feedback to blueprint changes, logged to `Learning_Weights` |
 | `video_agent/llm.py` | Hybrid LLM: Claude, OpenRouter, Gemini, OpenAI, tried in `LLM_PROVIDERS` order with fallback |
@@ -107,6 +110,20 @@ Every clip is converted to limited-range BT.709 at the first step (untagged clip
 BT.601, full-range phone footage is compressed to TV range), every intermediate is tagged, and
 grading runs in 16-bit with accurate rounding. Mismatched tags were the biggest colour error found
 by the benchmark.
+
+### Vision models
+
+`tools/models/` (not in git) holds the subject detector and the shot-understanding model:
+
+```bash
+mkdir -p tools/models/clip
+curl -L -o tools/models/yolox_s.onnx https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx
+H=https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main
+for f in onnx/vision_model_quantized.onnx onnx/text_model_quantized.onnx tokenizer.json; do curl -L -o tools/models/clip/$(basename $f) $H/$f; done
+```
+
+YOLOX-s (Megvii, Apache-2.0) finds the car/person in each shot; CLIP ViT-B/32 (OpenAI, MIT; 8-bit ONNX
+export) describes what each shot shows. Without them the agent still works, with simpler framing and matching.
 
 ### RIFE install
 

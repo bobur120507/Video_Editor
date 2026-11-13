@@ -24,7 +24,7 @@ from .media import iter_frames, probe
 
 log = logging.getLogger(__name__)
 
-WEIGHTS = {"cuts": 0.25, "camera": 0.25, "color": 0.20, "pace": 0.15, "flashes": 0.10, "duration": 0.05}
+WEIGHTS = {"cuts": 0.25, "camera": 0.25, "color": 0.20, "pace": 0.15, "flashes": 0.10, "duration": 0.05, "music_sync": 0.0}  # music_sync: reported, not yet weighted
 
 
 @dataclass
@@ -115,6 +115,40 @@ def _pace_score(ref_flow: np.ndarray, out_flow: np.ndarray) -> float:
     return max(0.0, float(np.corrcoef(a, b)[0, 1]))
 
 
+def _music_sync(reference: Path, output: Path, out_track, ref_track, cuts: list[float], fps: float) -> float:
+    """Share of big moves landing on a music hit or a cut (±2 frames), ours relative to the reference's.
+
+    Measures the edit's rhythm without asking for the same camera path, so it is fair to footage
+    that differs from the reference's.
+    """
+    import tempfile
+
+    from .analysis.events import detect_hits
+    from .media import extract_audio
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            hits = detect_hits(extract_audio(reference, Path(tmp) / "a.wav"))
+    except Exception:
+        return 1.0
+    marks = np.array(sorted([*hits, *cuts]))
+    if not len(marks):
+        return 1.0
+
+    def rate(track) -> float:
+        from scipy.signal import find_peaks
+
+        f = track.flow
+        peaks, _ = find_peaks(f, height=np.percentile(f, 80), distance=4)
+        if not len(peaks):
+            return 0.0
+        t = track.times[peaks]
+        return float(np.mean([np.min(np.abs(marks - x)) <= 2 / fps for x in t]))
+
+    ref_rate = rate(ref_track)
+    return 1.0 if ref_rate == 0 else min(1.0, rate(out_track) / ref_rate)
+
+
 def style_match(reference: str | Path, output: str | Path) -> MatchReport:
     reference, output = Path(reference), Path(output)
     ri, oi = probe(reference), probe(output)
@@ -133,6 +167,7 @@ def style_match(reference: str | Path, output: str | Path) -> MatchReport:
         "pace": _pace_score(ref_track.flow, out_track.flow),
         "flashes": _f1(ref_flashes, out_flashes, 2.5 / fps),
         "duration": closeness(abs(ri.duration - oi.duration) / 0.1),
+        "music_sync": _music_sync(reference, output, out_track, ref_track, ref_cuts, fps),
     }
     overall = sum(WEIGHTS[k] * v for k, v in parts.items())
     return MatchReport(

@@ -31,6 +31,7 @@ class AudioInfo(BaseModel):
     bpm: float = 0.0
     beats: list[float] = Field(default_factory=list)
     drops: list[float] = Field(default_factory=list)  # big energy jumps (beat drops)
+    hits: list[float] = Field(default_factory=list)  # strong onsets (kicks, snares, 808s) moves are synced to
     track_path: str | None = None  # extracted music track, reused at apply time
     has_music: bool = False
 
@@ -43,7 +44,7 @@ class SpeedPoint(BaseModel):
 
 
 class CameraCurve(BaseModel):
-    """Per-frame transform of a shot relative to its first frame (centre-based).
+    """Per-frame transform of a shot relative to its sharpest frame (centre-based).
 
     s = scale (>1 means content grows: zoom in), r = rotation in radians,
     x/y = translation as a fraction of frame width/height. One entry per reference frame.
@@ -81,6 +82,29 @@ class CameraCurve(BaseModel):
         }
 
 
+class Subject(BaseModel):
+    """Main subject of a shot (normalized frame coordinates)."""
+
+    cls: str
+    cx: float
+    cy: float
+    w: float
+    h: float
+
+
+class EditEvent(BaseModel):
+    """An editor's move inside a shot, re-created on new footage (see analysis/events.py)."""
+
+    kind: Literal["whip_in", "whip_out", "punch", "shake", "push"]
+    t: float  # seconds from the segment start
+    duration: float = 0.0
+    strength: float = 0.0  # punch: log-zoom; push: log-zoom per second; others: 0..1
+    dx: float = 0.0  # whip direction (unit vector, frame coordinates)
+    dy: float = 0.0
+    zoom: float = 0.0  # +1 zoom in, -1 zoom out
+    rot: float = 0.0  # shake rotation amplitude, degrees
+
+
 class Segment(BaseModel):
     start: float
     end: float
@@ -94,7 +118,10 @@ class Segment(BaseModel):
     thumb_t: float = 0.0  # when that frame is, in seconds from the segment start
     thumbs: list[list[float]] = Field(default_factory=list)  # several frames across the shot, for sequence alignment
     thumbs_t: list[float] = Field(default_factory=list)  # their times from the segment start
-    flash_frames: int = 0  # length of the white flash-in when transition_in == "flash"
+    flash_frames: int = 0
+    events: list[EditEvent] = Field(default_factory=list)
+    subject: Subject | None = None  # where the car/person is and how big, in the reference shot
+    clip: list[float] = Field(default_factory=list)  # CLIP embedding: what kind of shot this is  # length of the white flash-in when transition_in == "flash"
 
     @property
     def duration(self) -> float:
@@ -191,6 +218,8 @@ class Blueprint(BaseModel):
         effects = sorted({e for s in self.segments for e in s.effects})
         slow = sum(1 for s in self.segments if s.is_slowmo)
         moves = [s.camera.describe() for s in self.segments if s.camera]
+        ev = [e.kind for s in self.segments for e in s.events]
+        on_hits = sum(1 for s in self.segments for e in s.events if e.kind in ("punch", "shake") and any(abs(s.start + e.t - h) < 0.02 for h in self.audio.hits))
         zooms = sum(1 for m in moves if m["zoom"] > 1.03)
         rots = sum(1 for m in moves if m["rotation_deg"] > 1)
         shakes = sum(1 for m in moves if m["shake"] > 0.002)
@@ -201,6 +230,8 @@ class Blueprint(BaseModel):
             else "Music: none detected",
             f"Camera moves: {zooms} zoom, {rots} rotation, {shakes} shake shots"
             + (" · motion blur" if self.motion_blur else ""),
+            f"Edit moves: {ev.count('whip_in') + ev.count('whip_out')} whips, {ev.count('punch')} punches, {ev.count('shake')} shakes"
+            f" ({on_hits} on music hits), {ev.count('push')} pushes",
             f"Effects: {', '.join(effects) or 'none'} · slow-mo shots: {slow}",
             f"Hook score: {self.hook.score:.0f}/100 ({self.hook.cuts_in_first_3s} cuts in first 3s)",
             f"Render tier: {self.tier}",

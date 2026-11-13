@@ -188,7 +188,7 @@ def _estimate(path, bounds, fps, width):
 
     Anchoring on the first frame let a blurred transition frame at the start of a shot (the tail of
     the previous whip) spoil every measurement after it; from the sharpest frame a bad frame can
-    only spoil itself.
+    only spoil itself. Transforms are relative to that sharpest frame.
     """
     frames: list[list[np.ndarray]] = [[] for _ in bounds]
     for t, frame in iter_frames(path, sample_fps=fps, width=width):
@@ -210,11 +210,10 @@ def _estimate(path, bounds, fps, width):
                     # flash frames: hold the last transform, keep tracking from the last good frame
                     mats[i] = tracker.m if abs(lum - prev_lum) > 40 else tracker.update(shot[i])
                     prev_lum = lum
-            # Express relative to the first frame, as the rest of the pipeline expects.
-            first_inv = np.linalg.inv(mats[0])
+            # Relative to the sharpest frame: the shot's "true" framing is the identity transform.
             h, w = shot[0].shape
             for m in mats:
-                sc, r, x, y = _decompose(m @ first_inv, w, h)
+                sc, r, x, y = _decompose(m, w, h)
                 curve.s.append(round(sc, 5))
                 curve.r.append(round(r, 5))
                 curve.x.append(round(x, 5))

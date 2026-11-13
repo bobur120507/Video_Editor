@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from .blueprint import Blueprint, Segment
+from . import vision
 from .analysis.visual import detect_cuts
 from .media import Probe, color_stats, frame_at, iter_frames, probe, thumb
 
@@ -29,6 +30,13 @@ class ClipInfo:
     motion: np.ndarray  # normalized 0..1 motion per sampled frame
     thumbs: np.ndarray  # (N, zooms, 256) content thumbnails at `times`, one per THUMB_ZOOMS
     cut_after: np.ndarray  # (N,) True where a new shot starts in this footage
+    sem_times: np.ndarray = field(default_factory=lambda: np.zeros(0))  # CLIP samples (3 per second)
+    sem: np.ndarray = field(default_factory=lambda: np.zeros((0, 512)))
+
+    def semantic_at(self, t: float) -> np.ndarray | None:
+        if not len(self.sem_times):
+            return None
+        return self.sem[int(np.argmin(np.abs(self.sem_times - t)))]
 
     @property
     def path(self) -> Path:
@@ -81,7 +89,12 @@ def audit_clip(path: str | Path) -> ClipInfo:
         cuts[0] = True
         for c in detect_cuts(path, info.fps):
             cuts[min(len(th) - 1, int(round(c * info.fps)))] = True
-    return ClipInfo(probe=info, times=np.array(times), motion=np.clip(norm, 0, 1), thumbs=th, cut_after=cuts)
+    clip = ClipInfo(probe=info, times=np.array(times), motion=np.clip(norm, 0, 1), thumbs=th, cut_after=cuts)
+    if vision.available():
+        samples = list(iter_frames(path, sample_fps=3, width=320))
+        clip.sem_times = np.array([t for t, _ in samples])
+        clip.sem = vision.embed_images([f for _, f in samples])
+    return clip
 
 
 def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
@@ -237,6 +250,7 @@ def _rank_windows(seg: Segment, clip: ClipInfo, need: float) -> list[tuple[float
     else:
         framing = np.zeros(len(starts))
     cum = np.concatenate([[0.0], np.cumsum(clip.motion)])
+    ref_sem = np.array(seg.clip, dtype=np.float32) if seg.clip else None
     out = []
     for j, st in enumerate(starts):
         t0 = float(clip.times[st])
@@ -247,6 +261,12 @@ def _rank_windows(seg: Segment, clip: ClipInfo, need: float) -> list[tuple[float
         e = min(n, st + span)
         motion = (cum[e] - cum[st]) / max(1, e - st)
         score = float(framing[j]) - abs(motion - seg.motion) - 0.8 * max(0.0, 1 - length / need)
+        if ref_sem is not None:
+            sem = clip.semantic_at(t0 + length / 2)
+            if sem is not None:
+                # What the shot shows (wide/close, front/rear/wheel...) matters most. CLIP similarities
+                # between related car shots sit around 0.6-0.95, so this term dominates the choice.
+                score += 4.0 * float(sem @ ref_sem)
         out.append((t0, end, int(shot_id[st]), score))
     return out or [(0.0, min(need, clip.duration), 0, -1.0)]
 

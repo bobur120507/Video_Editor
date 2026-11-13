@@ -21,8 +21,10 @@ from ..blueprint import Blueprint, ColorProfile, TextOverlay
 from ..config import get_settings
 from ..director import CONTENT_MATCH, EditPlan, Shot
 from ..media import color_stats, ffmpeg, frame_at, iter_frames, probe
+from .. import vision
 from ..analysis.camera import estimate_curves, register_curve
 from .compositor import apply_camera, is_static, relative_curve
+from .motion import reframe, synthesize
 from .grade import FILTER as LUT_FILTER, SWS_FLAGS, fitted_lut, is_monochrome, transfer_lut
 from .rife import interpolate, rife_binary
 
@@ -164,7 +166,17 @@ def _render_shot(shot: Shot, bp: Blueprint, opts: RenderOptions, fps: int, n_fra
         # Same footage as the reference: register frame against frame — the editor's exact transform.
         camera = register_curve(base, reference, seg.start, n_frames, fps)
         absolute = camera is not None
-    if camera is None and opts.replay_camera and not is_static(seg.camera):
+    mirror_ok, centre = None, True
+    same_footage = shot.content_match >= CONTENT_MATCH
+    if camera is None and opts.replay_camera and seg.events and not same_footage:
+        # Different footage: re-create the editor's moves (whips, punches, shakes on the hits)
+        # rather than the reference camera's literal path. Same footage keeps the literal path below.
+        camera, mirror_ok = synthesize(seg.events, n_frames, fps)
+        if vision.available() and seg.subject is not None:
+            frames = [f for _, f in iter_frames(base, sample_fps=6, width=480)][:: max(1, n_frames // 18)]
+            camera = reframe(camera, seg.subject, vision.main_subject(frames[:4]), W, H)
+        centre = False
+    elif camera is None and opts.replay_camera and not is_static(seg.camera):
         own = estimate_curves(base, [(0.0, n_frames / fps)], fps)[0]
         camera = relative_curve(seg.camera, own, n_frames, fps, W, H)
     graded = tmp / f"{dst.stem}_graded.mp4" if camera else dst
@@ -173,7 +185,7 @@ def _render_shot(shot: Shot, bp: Blueprint, opts: RenderOptions, fps: int, n_fra
         shutter = bp.motion_blur
         if absolute and shutter and _already_blurred(base, reference, seg.start, n_frames, fps):
             shutter = 0.0  # the footage already carries the editor's blur (it is an edited video, not raw)
-        apply_camera(graded, dst, camera, W, H, fps, n_frames, shutter, LOSSLESS, absolute=absolute)
+        apply_camera(graded, dst, camera, W, H, fps, n_frames, shutter, LOSSLESS, absolute=absolute, mirror_ok=mirror_ok, centre=centre)
 
 
 def _already_blurred(footage: Path, reference: Path, ref_start: float, n_frames: int, fps: int) -> bool:

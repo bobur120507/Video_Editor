@@ -4,7 +4,7 @@ Status of every roadmap item. `[x]` done and tested · `[~]` partly done · `[ ]
 Updated after each milestone. The **core goal is matching the cloned video's edit as closely as possible**, so the
 Matching Engine sections come first; publishing comes last.
 
-Last updated: 2026-11-13 (milestone: pro TikTok edit test, hybrid tracker, PostgreSQL)
+Last updated: 2026-11-13 (milestone: edit-move translation, music sync, subject framing, YOLOX + CLIP)
 
 ---
 
@@ -18,35 +18,50 @@ Last updated: 2026-11-13 (milestone: pro TikTok edit test, hybrid tracker, Postg
 
 | Reel | Self-rebuild pixel SSIM | Self-rebuild match | On your footage |
 |---|---|---|---|
-| reel_1: cartoon "aura" edit, 37 s, 29 shots | 76.9% → **98.6%** | 85.2% → **99.0%** | – |
-| reel_2: "Yo Jordan" looksmax edit, 23 s, 22 shots | 78.1% → **98.3%** | 78.9% → **96.1%** | – |
-| crazy_edit: pro TikTok car edit, 9.8 s, 13 shots | **99.7%** | **87.9%** | McLaren rain clip: **~50%** style match |
+| reel_1: cartoon "aura" edit, 37 s, 29 shots | 76.9% → **98.9%** | 85.2% → **99.3%** | – |
+| reel_2: "Yo Jordan" looksmax edit, 23 s, 22 shots | 78.1% → **96.7%** (best 98.3%) | 78.9% → **96.4%** | – |
+| crazy_edit: pro TikTok car edit, 9.8 s, 13 shots | **99.7%** | **92.1%** | McLaren rain clip: music sync **95%**, style ~48% |
 
-(first run → now). The McLaren edit has the same rhythm, angle changes, whip/zoom moves and motion blur
-as the reference; what it can't copy is the content-dependent look (sunny teal sky and green grass vs a grey rainy
-street) and the reference's most extreme radial zoom blurs. Judge it by eye (`compare.png`), not only by the number.
+(first run → now). For the McLaren edit the literal-camera "style" number is the wrong yardstick: we now
+re-create the edit's moves (whips at the cuts, punches/shakes on the hits, push-ins) around the car instead of
+copying the orbit camera's path, so **music sync** (big moves landing on hits/cuts, vs the reference) is the
+meaningful number. What still differs: the reference's camera work (orbit/FPV shots), its sunny teal look, and its
+most extreme radial blurs. Judge by eye: `data/real/crazy_edit/_results/tiktok_vs_mclaren.png`.
 
 ### Ground-truth benchmark (`video-agent bench`, synthetic edits from the same raw footage)
 
 | Case | v0.1 style | v0.1 SSIM | **Now style** | **Now SSIM** |
 |---|---|---|---|---|
 | Cuts on the beat + warm grade | 47.2% | 67.0% | **99.5%** | **97.8%** |
-| Zoom punches | 47.7% | 71.0% | **97.4%** | **94.8%** |
-| Slow push-in + rotation sway | 42.5% | 66.6% | **95.3%** | **78.0%** |
-| Camera shake | 66.5% | 73.1% | **97.4%** | **97.9%** |
-| Speed ramps | 67.8% | 74.5% | **99.8%** | **90.5%** |
-| Flash transitions + cool grade | 36.0% | 57.7% | **98.9%** | **97.5%** |
-| **Average** | **51.3%** | **68.3%** | **98.0%** | **92.8%** |
+| Zoom punches | 47.7% | 71.0% | **97.6%** | **96.1%** |
+| Slow push-in + rotation sway | 42.5% | 66.6% | **90.8%** | **76.0%** |
+| Camera shake | 66.5% | 73.1% | **97.5%** | **96.2%** |
+| Speed ramps | 67.8% | 74.5% | **99.8%** | **94.4%** |
+| Flash transitions + cool grade | 36.0% | 57.7% | **99.5%** | **97.5%** |
+| **Average** | **51.3%** | **68.3%** | **97.5%** | **93.0%** |
 
 Still not covered by any test: footage with moving subjects for speed ramps, on-screen text, and real raw footage.
 
 ---
 
+## Beating human editors: the gaps, in priority order
+
+1. [~] **Subject understanding**: YOLOX finds the car/person per shot; footage is reframed so the subject's size/position match the reference, and moves happen around the subject. Next: track the subject through the shot (it's a per-shot median now).
+2. [~] **Shot understanding**: CLIP describes every reference shot and every moment of your footage; the Director uses it to pick moments. Weak on fine angle differences (front vs rear 3/4) — next: angle classifier from CLIP text prompts + subject box shape.
+3. [ ] **Camera work vs editing**: footage filmed static can't become an orbit/FPV shot. Detect when the reference's power is camera work and tell the user what to film (or source it).
+4. [ ] **Music**: own-song re-timing (cuts and moves to the new track's hits), drops, risers, sound-effect hits (whooshes, impacts) added on transitions.
+5. [ ] **Effects a pro uses**: radial zoom blur, directional blur, RSMB-style motion blur, glow, chromatic aberration, sky replacement, subject masks (text behind subject), speed ramps (velocity edits).
+6. [ ] **Look**: grade transfer that respects the content (mood, sky, skin), not only statistics.
+7. [ ] **Taste and judgement**: which moments are the best (sharpest, most dramatic), when to break the template, story/hook — learned from many edits + your feedback + performance data.
+8. [ ] **Measurement of what humans see**: the style score is still a proxy; a human-preference check (A/B with you) is the final judge.
+
 ## A. Matching Engine — measurement
 
 - [x] **Match score** (`video-agent score ref.mp4 out.mp4`): cuts (±1.5 frames), camera motion (frame-to-frame), colour (Lab per shot), pace, flashes, duration → one %
 - [x] Camera metric validated with control tests (identical 100%, re-encode 97.5%, upscaled real Reel 92.6%; v0.1 outputs 57–72%, new 91–100%); tolerance grows with move size, unreadable blurred frames skipped
-- [ ] Camera metric still under-reports on extreme whip/blur edits (69% on a 99.7%-pixel-identical rebuild)
+- [ ] Camera metric still under-reports on extreme whip/blur edits (68% on a 99.7%-pixel-identical rebuild)
+- [x] **Music sync** measure: share of big moves on hits/cuts vs the reference (reported, not yet weighted in the overall %)
+- [ ] Known: push_rotate benchmark down 95% → 91% (its flat-gradient shot isn't confirmed as same footage, so it gets re-created moves); reel_2 self-rebuild 98.3% → 96.7% pixel
 - [x] **Pixel similarity** (SSIM) for same-footage tests
 - [x] **Ground-truth benchmark** (`video-agent bench`): 6 synthetic edits, history saved in `data/bench/history.jsonl`
 - [x] Score sent in Telegram after every render (when the reference file is on the server)
@@ -64,6 +79,9 @@ Still not covered by any test: footage with moving subjects for speed ramps, on-
 - [x] Motion energy per shot (optical flow)
 - [x] White-flash detection, with flash length in frames
 - [x] **Per-frame camera curves**: zoom, rotation, pan, shake for every frame of every shot; features tracked continuously and fitted to the shot's first frame (no drift)
+- [x] **Shot curves anchored on the sharpest frame** (tracked forwards and backwards); a blurred transition frame at a shot's start no longer tilts/zooms the whole shot
+- [x] **Edit events** (motion translation): whips in/out, punch-zooms, shake bursts and push per shot, separated from the original camera's movement
+- [x] **Music hits** (strong onsets: kicks, snares, 808s); punches and shakes are snapped to them
 - [x] **Hybrid tracker for whip pans / zoom blurs**: frames too blurred for features use whole-image alignment at low resolution, with sanity limits
 - [x] Motion-blur detection: fastest vs slowest third of frames per shot → none / 180° / 360° shutter (pro edits never hold still)
 - [x] Per-shot colour profile (Lab mean/contrast) + content thumbnail for footage matching
@@ -84,6 +102,8 @@ Still not covered by any test: footage with moving subjects for speed ramps, on-
 
 - [x] FFmpeg shot pipeline: 9:16 crop, speed pieces, effects, text, Instagram-spec encode
 - [x] **Frame-by-frame registration** when the footage is the reference's own: the editor's exact transform, no guessing (real-Reel pixel match 80% → 96%)
+- [x] **Motion translation on different footage**: the editor's moves are re-created on the hits (whip smears with mirrored edges like AE Motion Tile, punches, shakes, capped digital push) instead of copying the reference camera's literal path
+- [x] Replay centred on the shot's typical (median) framing, not the middle of its range
 - [x] **Keyframe compositor**: replays per-frame camera curves on new footage, cancels the footage's own motion first, automatic cover zoom, AE-style motion blur. Runs on the CPU (OpenCV), directly on YUV planes (lossless).
 - [x] **RIFE AI slow motion** on the Intel GPU (Vulkan), FFmpeg `minterpolate` as automatic fallback
 - [x] **Colour as 3D LUTs in 16-bit**: fitted from aligned frames when the footage matches the reference, Lab look transfer otherwise
@@ -113,7 +133,9 @@ Still not covered by any test: footage with moving subjects for speed ramps, on-
 - [x] Motion-matched clip-window assignment otherwise, avoids repeating clips
 - [x] Face-centred vertical crop (static per shot)
 - [x] Missing-shot list when footage is short
-- [ ] Tracked dynamic crop (follows the subject during the shot); better face/person/car detection
+- [x] Car/person detection (YOLOX-s) and subject-matched framing per shot
+- [x] CLIP shot similarity in footage selection
+- [ ] Tracked dynamic crop (follows the subject during the shot)
 - [ ] Content matching for *different* footage (close-up → close-up) using image embeddings
 - [ ] Re-timing cuts to a different song's beats when the user brings their own music
 - [ ] Stock footage fill (Pexels API key; code not written yet)
@@ -122,9 +144,9 @@ Still not covered by any test: footage with moving subjects for speed ramps, on-
 ## E. Internet asset sourcing (AI Director, spec 5.2) — NOT BUILT YET
 
 When you have no footage: find clips/images that match each reference shot (~95%) and edit them in.
-- [ ] Stock video search with licences that allow posting: Pexels, Pixabay (free API keys), Coverr
+- [ ] Stock video search with licences that allow posting: Pixabay (key requested, ~1 day), Pexels (new keys paused by Pexels), Coverr
 - [ ] Query planning per shot with the LLM: subject + setting + shot type + camera move ("McLaren 720S Spider, rain, night, low angle rear, slow push-in")
-- [ ] Ranking candidates against each reference shot: CLIP image-text and image-image similarity, framing, motion, colour, resolution
+- [~] Ranking candidates against each reference shot: CLIP is installed and used for footage; still to wire into sourcing with framing, motion, colour, resolution
 - [ ] Download, trim the best window, then edit as usual; report the match % per shot and which shots had no good candidate
 - [ ] AI image/video generation to fill shots nothing matches (needs a paid API: e.g. Runway, Luma, Kling, Veo)
 - [ ] Legal guardrails: only licensed sources; brand footage from press sites only under their terms; no scraping of other creators' videos
@@ -140,11 +162,11 @@ When you have no footage: find clips/images that match each reference shot (~95%
 - [x] Own git repo, Python 3.12 venv, `pyproject.toml`, CLI (`video-agent`)
 - [x] Database: all 5 tables from the spec. **PostgreSQL** (JSONB, connection pool) via `DATABASE_URL`; SQLite only as a fallback. Tested on a temporary PostgreSQL 18
 - [x] `video-agent migrate-db` copies the old SQLite data into PostgreSQL
-- [ ] Create your `video_agent` database/role and set `DATABASE_URL` (needs your PostgreSQL password — see README)
+- [x] Your `video_agent` PostgreSQL database created, `DATABASE_URL` set, SQLite data migrated
 - [x] Redis FSM storage (optional via `REDIS_URL`)
 - [x] Hybrid LLM: Claude → OpenRouter → Gemini → OpenAI with fallback; built-in rules when no key
-- [x] Tests (10), incl. end-to-end clone → render, lossless compositor round trip, motion compensation
-- [x] RIFE installed in `tools/rife/` (not in git; see README)
+- [x] Tests (13), incl. end-to-end clone → render, lossless compositor round trip, motion compensation
+- [x] RIFE installed in `tools/rife/`; YOLOX-s and CLIP in `tools/models/` (not in git; see README)
 - [~] Render queue: in-process limiter (`MAX_PARALLEL_RENDERS`); no Celery workers yet
 - [ ] Local Telegram Bot API server (2 GB file limit instead of 20/50 MB)
 - [ ] GPU/cloud render server for scale
