@@ -1011,3 +1011,28 @@ More contrast does nothing measurable. Calming yellows and lifting greens and bl
 
 - **Portal:** the previous shot now stays still, full size, while the opening closes around it like an iris, as in the TikTok. Shrinking it as well had added a second zoom. The zoomed-in next shot is blurred in proportion to the zoom. On a test clip, motion during the portal went 5.4 → 4.1 px/frame (TikTok 3.0). Starting the opening smaller (the TikTok's 60% of the width) measured worse (5.1) and was reverted. After the first flash the real wheel shows, then the second flash (`compare/transitions/portal_v15.png`).
 - **Cut-out:** the car fades in over the first 40% of its rise and grows from 70% to full size. The extra cut detection at 4.80s stays: our car is a medium shot's car, much bigger in frame than the TikTok's.
+
+### Polishing v15 (2026-11-17, not rendered)
+
+**Cut-out at 4.80s:** while our car rises, the detector's score climbs to 28.2–28.4, just over 27. The TikTok's small, blurred car stays at 12–19. The picture really changes (similarity 0.64), so it is not a motion artefact the filter should drop: our layer is simply bigger. Tested on v15's own frames:
+
+| Entrance (start size, fade-in share of the rise) | Peak score | Extra cut |
+|---|---|---|
+| 70%, 40% (v15) | 27.4 | yes |
+| 55%, 60% | 24.8 | no |
+| **50%, 70% (chosen)** | 24.2 | no |
+| 35%, 100% | 23.7 | no |
+
+**Frame-by-frame defect scan of v15** (all 30 frames per second; cuts and transitions excluded):
+- No brightness jumps inside shots; the TikTok itself has three.
+- Sudden softenings at 3.90s, 4.23s and 4.53s are the punches' motion blur, at the TikTok's own moments (3.87s, 3.97s, 4.17s, 4.57s).
+- 0.57s goes from crisp to blurred in one frame on the punch; the TikTok is already soft before it. Style, not a defect.
+- **Colour noise:** 1.16 median against the TikTok's 0.85. The colour boost turns rain texture into coloured speckle.
+
+**Chroma-only noise reduction** after the grade (`RenderOptions.chroma_denoise`, FFmpeg `hqdn3d=0:4:0:3`: brightness untouched). Tested on 1 s of v15: colour noise 1.11 → 0.98, sharpness 5175 → 5162 (unchanged).
+
+With the gentler cut-out and chroma noise reduction: tests 31 pass. Benchmark **97.7%** (before: 97.9%). Pixel match (SSIM) 93.0% → 93.2%, colour 95.7% → 95.4%. Camera 93.7% → 91.7%, all in zoom_punch and shake, the cases whose camera part varies between runs; noise reduction does not touch brightness, which is what the camera tracker reads.
+
+### Sixteenth velocity test edit (v16, `velocity_test/mclaren_velocity_v16.mp4`, render 19 min)
+
+**Overall 71.0%** (v15 70.1%). Cuts 92% → **96%**: all 12 real cuts, no extra detections (the cut-out no longer reads as a cut). Colour noise 1.17 → **1.06**; sharpness 4983 → 4916 (−1%, unchanged to the eye). Pace 77%, shake 100%, smooth 92%, flow 91%; colour 21% and camera 4% as before (footage-bound, see "Where the remaining points are").

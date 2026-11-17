@@ -31,8 +31,10 @@ log = logging.getLogger(__name__)
 # detector read it 2 frames late (McLaren v13).
 FRAMES = {"panel": (7, 2), "portal": (5, 5), "cutout": (5, 0)}
 PORTAL_BLUR = 0.004  # blur (sigma, share of the frame width) per unit of log zoom on the zoomed-in next shot
-CUTOUT_START_SIZE = 0.7  # the cut-out car's size when it enters, growing to full size as it lands
-CUTOUT_FADE = 0.4  # share of the rise over which the car fades in
+# The cut-out car enters smaller and fainter, like the TikTok's small, blurred one. At 70% / 40% it read as
+# a cut of its own (detector score 27.4 > 27, McLaren v15 at 4.80 s); 55% / 60% scored 24.8.
+CUTOUT_START_SIZE = 0.5  # the cut-out car's size when it enters, growing to full size as it lands
+CUTOUT_FADE = 0.7  # share of the rise over which the car fades in
 
 
 def ease(u: float) -> float:

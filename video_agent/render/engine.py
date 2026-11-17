@@ -77,6 +77,10 @@ class RenderOptions:
     # and overcast sky it turned whole street shots cyan (3-4 s, your v12 review: +5.6 green, +3.3 blue).
     keep_greys: bool = True
     transitions: bool = True  # panel / wheel portal / car cut-out transitions from the template (render/transitions.py)
+    # Colour-only noise reduction after the grade (FFmpeg hqdn3d: luma 0, chroma spatial/temporal): the
+    # colour boost turns rain texture into coloured speckle (v15: 1.16 vs the TikTok's 0.85). 0:4:0:3
+    # cut it by 12% with sharpness unchanged (5175 -> 5162). "" turns it off.
+    chroma_denoise: str = "0:4:0:3"
     effect_intensity: float = 1.0
     interpolate_slowmo: bool = True
     replay_camera: bool = True  # replay the reference's per-frame zoom/rotation/pan/shake
@@ -266,6 +270,8 @@ def _render_shot(shot: Shot, bp: Blueprint, opts: RenderOptions, fps: int, n_fra
     post = []
     if lut:
         post.append(LUT_FILTER.format(path=lut))
+        if opts.chroma_denoise:
+            post.append(f"hqdn3d={opts.chroma_denoise}")
     else:
         eq = _color_eq(stats, target, strength)
         post.append("eq=" + ":".join(f"{k}={v}" for k, v in eq.items()))
