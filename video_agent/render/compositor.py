@@ -92,11 +92,14 @@ def _corner_shift(m1: np.ndarray, m2: np.ndarray, w: int, h: int) -> float:
     return float(np.linalg.norm(corners @ m1.T - corners @ m2.T, axis=1).max())
 
 
-def _warp_planes(planes: list[np.ndarray], m: np.ndarray, w: int, h: int) -> list[np.ndarray]:
-    """Warp Y at full size and U/V at half size with the same transform (no YUV->RGB round trip)."""
+def _warp_planes(planes: list[np.ndarray], m: np.ndarray, w: int, h: int, sharp: bool = True) -> list[np.ndarray]:
+    """Warp Y at full size and U/V at half size with the same transform (no YUV->RGB round trip).
+
+    Bicubic keeps fine detail on crisp frames; bilinear is enough for motion-blur sub-samples.
+    """
     mc = m.copy()
     mc[:, 2] /= 2
-    flags, border = cv2.INTER_LINEAR, cv2.BORDER_REFLECT
+    flags, border = (cv2.INTER_CUBIC if sharp else cv2.INTER_LINEAR), cv2.BORDER_REFLECT
     return [
         cv2.warpAffine(planes[0], m, (w, h), flags=flags, borderMode=border),
         cv2.warpAffine(planes[1], mc, (w // 2, h // 2), flags=flags, borderMode=border),
@@ -104,21 +107,40 @@ def _warp_planes(planes: list[np.ndarray], m: np.ndarray, w: int, h: int) -> lis
     ]
 
 
-def apply_camera(src: Path, dst: Path, curve: CameraCurve, width: int, height: int, fps: int, n_frames: int, shutter: float,
+def _plan(curve: CameraCurve, n_frames: int, fps: float, width: int, height: int, absolute: bool = False,
+          mirror_ok: np.ndarray | None = None, centre: bool = True) -> tuple[np.ndarray, float]:
+    """Per-frame (scale, rotation, x, y) and the cover zoom, exactly as apply_camera uses them."""
+    if absolute:
+        return np.array([curve.at(i / fps) for i in range(n_frames)], dtype=np.float64), 1.0
+    p = _params(curve, n_frames, fps) if centre else np.array([curve.at(i / fps) for i in range(n_frames)], dtype=np.float64)
+    keep = ~mirror_ok[:n_frames] if mirror_ok is not None and (~mirror_ok[:n_frames]).any() else np.ones(n_frames, bool)
+    return p, _cover_zoom(p[keep], width, height)
+
+
+def framed(frames: list[tuple[int, np.ndarray]], curve: CameraCurve, width: int, height: int, fps: float, n_frames: int,
+           absolute: bool = False, mirror_ok: np.ndarray | None = None, centre: bool = True) -> list[np.ndarray]:
+    """(frame index, BGR frame of any size with the output's aspect) -> the frames as the camera
+    will show them (no motion blur). For measuring what ends up on screen, e.g. the colour grade."""
+    p, k = _plan(curve, n_frames, fps, width, height, absolute, mirror_ok, centre)
+    out = []
+    for i, f in frames:
+        h, w = f.shape[:2]
+        sc = np.diag([w / width, h / height, 1.0])
+        m = sc @ np.vstack([_matrix(*p[min(max(i, 0), n_frames - 1)], k, width, height), [0, 0, 1]]) @ np.linalg.inv(sc)
+        out.append(cv2.warpAffine(f, m[:2], (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT))
+    return out
+
+
+def apply_camera(src: Path, dst: Path, curve: CameraCurve, width: int, height: int, fps: int, n_frames: int, shutter: float | np.ndarray,
                  encode_args: list, absolute: bool = False, mirror_ok: np.ndarray | None = None, centre: bool = True) -> None:
     """absolute=True: the curve is an exact per-frame registration, applied as is (no re-centring or cover zoom).
 
     mirror_ok marks frames allowed to show mirrored edges (whip frames, hidden by motion blur, like
     After Effects' Motion Tile); they are left out of the cover-zoom calculation.
     centre=False keeps a synthesized curve's framing as designed.
+    shutter is one value for the whole shot or one per frame (0 = crisp frame).
     """
-    if absolute:
-        p = np.array([curve.at(i / fps) for i in range(n_frames)], dtype=np.float64)
-        k = 1.0
-    else:
-        p = _params(curve, n_frames, fps) if centre else np.array([curve.at(i / fps) for i in range(n_frames)], dtype=np.float64)
-        keep = ~mirror_ok[:n_frames] if mirror_ok is not None and (~mirror_ok[:n_frames]).any() else np.ones(n_frames, bool)
-        k = _cover_zoom(p[keep], width, height)
+    p, k = _plan(curve, n_frames, fps, width, height, absolute, mirror_ok, centre)
     idx = np.arange(n_frames, dtype=np.float64)
 
     def at(f: float) -> np.ndarray:
@@ -148,17 +170,18 @@ def apply_camera(src: Path, dst: Path, curve: CameraCurve, width: int, height: i
             if planes is None:
                 raise RuntimeError(f"No frames could be read from {src}")
             m = _matrix(*at(i), k, width, height)
+            sh = float(shutter[min(i, len(shutter) - 1)]) if isinstance(shutter, np.ndarray) else shutter
             samples = 1
-            if shutter > 0:
-                m_a, m_b = _matrix(*at(i - shutter / 2), k, width, height), _matrix(*at(i + shutter / 2), k, width, height)
+            if sh > 0:
+                m_a, m_b = _matrix(*at(i - sh / 2), k, width, height), _matrix(*at(i + sh / 2), k, width, height)
                 samples = int(min(MAX_BLUR_SAMPLES, max(1, math.ceil(_corner_shift(m_a, m_b, width, height) / 2))))
             if samples == 1:
                 out = _warp_planes(planes, m, width, height)
             else:
                 acc = [np.zeros(pl.shape, np.float32) for pl in planes]
                 for j in range(samples):
-                    f = i + (j / (samples - 1) - 0.5) * shutter
-                    for a_, w_ in zip(acc, _warp_planes(planes, _matrix(*at(f), k, width, height), width, height)):
+                    f = i + (j / (samples - 1) - 0.5) * sh
+                    for a_, w_ in zip(acc, _warp_planes(planes, _matrix(*at(f), k, width, height), width, height, sharp=False)):
                         a_ += w_
                 out = [np.clip(a_ / samples + 0.5, 0, 255).astype(np.uint8) for a_ in acc]
             for pl in out:

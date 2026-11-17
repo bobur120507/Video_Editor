@@ -14,7 +14,9 @@ from pydantic import BaseModel, Field
 BLUEPRINT_VERSION = 1
 
 Effect = Literal["zoom_punch", "shake", "flash"]
-Transition = Literal["cut", "flash", "zoom"]
+# panel: the next shot enters as a window growing from a corner; portal: the next shot zooms out of its
+# wheel with the previous shot inside the wheel's opening; cutout: the next shot's car, cut out, rises in.
+Transition = Literal["cut", "flash", "zoom", "panel", "portal", "cutout"]
 
 
 class SourceInfo(BaseModel):
@@ -31,7 +33,9 @@ class AudioInfo(BaseModel):
     bpm: float = 0.0
     beats: list[float] = Field(default_factory=list)
     drops: list[float] = Field(default_factory=list)  # big energy jumps (beat drops)
-    hits: list[float] = Field(default_factory=list)  # strong onsets (kicks, snares, 808s) moves are synced to
+    hits: list[float] = Field(default_factory=list)  # where strong drum hits start (attack), moves are synced to these
+    hit_kinds: list[str] = Field(default_factory=list)  # per hit: "kick" (kick/808), "snare" (snare/clap/hats) or "hit"
+    sync_to: str = ""  # the drum the reference editor cut on, when the cuts follow one
     track_path: str | None = None  # extracted music track, reused at apply time
     has_music: bool = False
 
@@ -103,6 +107,7 @@ class EditEvent(BaseModel):
     dy: float = 0.0
     zoom: float = 0.0  # +1 zoom in, -1 zoom out
     rot: float = 0.0  # shake rotation amplitude, degrees
+    source: Literal["detected", "carried", "user"] = "detected"  # carried: added to continue a whip across a cut
 
 
 class Segment(BaseModel):
@@ -118,10 +123,14 @@ class Segment(BaseModel):
     thumb_t: float = 0.0  # when that frame is, in seconds from the segment start
     thumbs: list[list[float]] = Field(default_factory=list)  # several frames across the shot, for sequence alignment
     thumbs_t: list[float] = Field(default_factory=list)  # their times from the segment start
-    flash_frames: int = 0
+    flash_frames: int = 0  # length of the white flash-in when transition_in == "flash"
+    transition_frames: int = 0  # panel/portal/cutout: frames of the transition (0 = its default)
+    transition_from: str = ""  # panel: the corner it grows from ("top_right"...); cutout: the edge it rises from
     events: list[EditEvent] = Field(default_factory=list)
     subject: Subject | None = None  # where the car/person is and how big, in the reference shot
-    clip: list[float] = Field(default_factory=list)  # CLIP embedding: what kind of shot this is  # length of the white flash-in when transition_in == "flash"
+    clip: list[float] = Field(default_factory=list)  # CLIP embedding: what kind of shot this is
+    blur: list[float] = Field(default_factory=list)  # per reference frame: 0 crisp .. 1 smeared (vs the shot's sharpest)
+    velocity: list[float] = Field(default_factory=list)  # per reference frame: motion (px/frame at 160 px width), the edit's motion wave
 
     @property
     def duration(self) -> float:
@@ -160,6 +169,13 @@ class ColorProfile(BaseModel):
     rgb_mean: tuple[float, float, float] = (0.45, 0.45, 0.45)
     lab_mean: tuple[float, float, float] | None = None  # CIE Lab (L 0..100), used for look transfer
     lab_std: tuple[float, float, float] | None = None
+    # Distributions (media.QUANTILES) of lightness and of colourfulness (distance from the mean
+    # colour): the grade matches these, not only the mean and spread. None on older blueprints.
+    l_quantiles: tuple[float, ...] | None = None
+    chroma_quantiles: tuple[float, ...] | None = None
+    # Tint of the greys and whites (the grade, not the content) and colourfulness measured from it.
+    neutral_ab: tuple[float, float] | None = None
+    neutral_chroma_quantiles: tuple[float, ...] | None = None
     lut_path: str | None = None  # optional .cube LUT applied after matching
 
 
@@ -206,6 +222,9 @@ class Blueprint(BaseModel):
     output: OutputSpec = Field(default_factory=OutputSpec)
     tier: Literal["standard", "pro"] = "standard"
     motion_blur: float = 0.0  # shutter fraction for camera moves (0.5 = 180 degrees, like After Effects)
+    # "velocity": never-stopping motion, speed ramps between hits, smeared (analysis/velocity.py);
+    # "calm": still between moves and sharp. Old blueprints are calm.
+    style: Literal["calm", "velocity"] = "calm"
     notes: list[str] = Field(default_factory=list)
 
     @property
@@ -234,6 +253,7 @@ class Blueprint(BaseModel):
             f" ({on_hits} on music hits), {ev.count('push')} pushes",
             f"Effects: {', '.join(effects) or 'none'} · slow-mo shots: {slow}",
             f"Hook score: {self.hook.score:.0f}/100 ({self.hook.cuts_in_first_3s} cuts in first 3s)",
+            f"Style: {'velocity edit (speed ramps, never-stopping motion)' if self.style == 'velocity' else 'calm edit'}",
             f"Render tier: {self.tier}",
         ]
         return "\n".join(lines)

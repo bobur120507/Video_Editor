@@ -24,7 +24,15 @@ from .media import iter_frames, probe
 
 log = logging.getLogger(__name__)
 
-WEIGHTS = {"cuts": 0.25, "camera": 0.25, "color": 0.20, "pace": 0.15, "flashes": 0.10, "duration": 0.05, "music_sync": 0.0}  # music_sync: reported, not yet weighted
+# "Feel" parts (timing, shake, smooth, sharp, flow) measure what a viewer notices first: moves late or
+# scattered around the beat, more shaking than the reference, jerky motion, smeared pictures, and
+# motion that does not rise and fall with the music the way the reference's does.
+WEIGHTS = {
+    "cuts": 0.20, "camera": 0.15, "color": 0.15, "pace": 0.04, "flashes": 0.05, "duration": 0.05,
+    "timing": 0.10, "shake": 0.08, "smooth": 0.07, "sharp": 0.05, "flow": 0.06,
+    "music_sync": 0.0,  # reported only: superseded by timing
+}
+FRAME_MS = 1000 / 30
 
 
 @dataclass
@@ -128,7 +136,7 @@ def _music_sync(reference: Path, output: Path, out_track, ref_track, cuts: list[
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            hits = detect_hits(extract_audio(reference, Path(tmp) / "a.wav"))
+            hits, _ = detect_hits(extract_audio(reference, Path(tmp) / "a.wav"))
     except Exception:
         return 1.0
     marks = np.array(sorted([*hits, *cuts]))
@@ -147,6 +155,107 @@ def _music_sync(reference: Path, output: Path, out_track, ref_track, cuts: list[
 
     ref_rate = rate(ref_track)
     return 1.0 if ref_rate == 0 else min(1.0, rate(out_track) / ref_rate)
+
+
+def _hits(reference: Path) -> list[float]:
+    import tempfile
+
+    from .analysis.events import detect_hits
+    from .media import extract_audio
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            return detect_hits(extract_audio(reference, Path(tmp) / "a.wav"))[0]
+    except Exception:
+        return []
+
+
+def _moves(track) -> np.ndarray:
+    """Times of the big motion peaks (whips, punches, jolts): what the eye reads as a move."""
+    from scipy.signal import find_peaks
+
+    f = track.flow
+    if len(f) < 5:
+        return np.zeros(0)
+    peaks, _ = find_peaks(f, height=np.percentile(f, 80), distance=3)
+    return track.times[peaks]
+
+
+def _offsets(times, hits: np.ndarray, fps: float) -> np.ndarray:
+    """Milliseconds from each move/cut to its hit, for those within 3 frames of one."""
+    if not len(hits):
+        return np.zeros(0)
+    d = np.array([t - hits[np.argmin(np.abs(hits - t))] for t in times])
+    return d[np.abs(d) <= 3 / fps] * 1000 if len(d) else d
+
+
+def _feel(ref_track, out_track, ref_cuts, out_cuts, hits: list[float], fps: float, reference: Path, output: Path) -> tuple[dict, dict]:
+    """Timing, shake amount, smoothness and sharpness of the output, each judged against the reference."""
+    h = np.array(hits)
+    ref_off = _offsets([*ref_cuts, *_moves(ref_track)], h, fps)
+    out_off = _offsets([*out_cuts, *_moves(out_track)], h, fps)
+    if len(ref_off) and len(out_off):
+        # Late/early overall (median) and scattered (spread) are both felt; a frame is the unit.
+        shift = abs(float(np.median(out_off) - np.median(ref_off))) / FRAME_MS
+        spread = max(0.0, float(np.mean(np.abs(out_off - np.median(out_off))) - np.mean(np.abs(ref_off - np.median(ref_off))))) / FRAME_MS
+        timing = closeness(shift) * closeness(spread)
+    else:
+        timing = 1.0 if not len(ref_off) else 0.5
+
+    dur_r, dur_o = max(ref_track.times[-1], 1e-3), max(out_track.times[-1], 1e-3)
+    rate_r, rate_o = len(_moves(ref_track)) / dur_r, len(_moves(out_track)) / dur_o
+    # Moves per second: 25% more or fewer than the reference is just noticeable.
+    shake = closeness(abs(math.log((rate_o + 0.2) / (rate_r + 0.2))) / math.log(1.25))
+
+    def rough(f):
+        return float(np.abs(np.diff(f, 2)).mean() / (f.mean() + 1e-6)) if len(f) > 3 else 0.0
+
+    smooth = closeness(max(0.0, rough(out_track.flow) / (rough(ref_track.flow) + 1e-6) - 1) / 0.15)
+
+    def smeared(path):
+        s = np.array([cv2.Laplacian(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), cv2.CV_32F).var() for _, fr in iter_frames(path, sample_fps=10, width=360)])
+        return float((s < 0.35 * np.quantile(s, 0.9)).mean()) if len(s) else 0.0
+
+    flow, wave_r, wave_o = _flow(ref_track.flow, out_track.flow, h, fps)
+    sm_r, sm_o = smeared(reference), smeared(output)
+    sharp = closeness(max(0.0, sm_o - sm_r) / 0.1)  # only blurrier than the reference counts against
+    details = {
+        "timing_ms": {"ref_median": round(float(np.median(ref_off)), 1) if len(ref_off) else None,
+                      "out_median": round(float(np.median(out_off)), 1) if len(out_off) else None},
+        "moves_per_s": {"ref": round(float(rate_r), 2), "out": round(float(rate_o), 2)},
+        "roughness": {"ref": round(rough(ref_track.flow), 3), "out": round(rough(out_track.flow), 3)},
+        "smeared": {"ref": round(sm_r, 2), "out": round(sm_o, 2)},
+        "motion_wave": {"ref": wave_r, "out": wave_o},
+    }
+    return {"timing": timing, "shake": shake, "smooth": smooth, "sharp": sharp, "flow": flow}, details
+
+
+WAVE = 8  # frames either side of a hit
+
+
+def _wave(flow: np.ndarray, hits: np.ndarray, fps: float) -> tuple[np.ndarray, float]:
+    """Average motion around the music hits (÷ typical motion), and fast ÷ typical motion."""
+    flow = np.asarray(flow, dtype=np.float64)
+    med = float(np.median(flow)) + 1e-6
+    rows = [flow[f - WAVE:f + WAVE + 1] / med for f in (np.round(hits * fps).astype(int) if len(hits) else [])
+            if WAVE <= f < len(flow) - WAVE]
+    profile = np.mean(rows, axis=0) if rows else np.ones(2 * WAVE + 1)
+    return profile, float(np.quantile(flow, 0.9)) / med if len(flow) else 1.0
+
+
+def _flow(ref_flow, out_flow, hits: np.ndarray, fps: float) -> tuple[float, dict, dict]:
+    """Does the edit's motion breathe like the reference's: the same rise and fall around the hits
+    (correlation of the two waves) and the same contrast between fast and typical moments."""
+    pr, rr = _wave(ref_flow, hits, fps)
+    po, ro = _wave(out_flow, hits, fps)
+    shape = float(np.corrcoef(pr, po)[0, 1]) if pr.std() > 1e-6 and po.std() > 1e-6 else (1.0 if pr.std() <= 1e-6 and po.std() <= 1e-6 else 0.0)
+    contrast = closeness(abs(math.log((ro + 1e-6) / (rr + 1e-6))) / math.log(1.5))  # 1.5x the contrast is noticeable
+    score = contrast * (0.5 + 0.5 * max(0.0, shape))
+
+    def info(p, r):
+        return {"fast_vs_typical": round(r, 2), "around_hit": [round(float(v), 2) for v in p]}
+
+    return score, info(pr, rr), info(po, ro)
 
 
 def style_match(reference: str | Path, output: str | Path) -> MatchReport:
@@ -169,11 +278,13 @@ def style_match(reference: str | Path, output: str | Path) -> MatchReport:
         "duration": closeness(abs(ri.duration - oi.duration) / 0.1),
         "music_sync": _music_sync(reference, output, out_track, ref_track, ref_cuts, fps),
     }
+    feel, feel_details = _feel(ref_track, out_track, ref_cuts, out_cuts, _hits(reference), fps, reference, output)
+    parts.update(feel)
     overall = sum(WEIGHTS[k] * v for k, v in parts.items())
     return MatchReport(
         overall=round(overall * 100, 1),
         parts={k: round(v * 100, 1) for k, v in parts.items()},
-        details={"ref_cuts": ref_cuts, "out_cuts": out_cuts},
+        details={"ref_cuts": ref_cuts, "out_cuts": out_cuts, **feel_details},
     )
 
 

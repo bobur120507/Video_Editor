@@ -90,6 +90,34 @@ class LearningWeight(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class MoveLabel(Base):
+    """A user's check of the moves detected in a reference: ground truth for detection and scoring."""
+
+    __tablename__ = "move_labels"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    blueprint_id: Mapped[int] = mapped_column(ForeignKey("edit_blueprints.id"))
+    source_sha256: Mapped[str] = mapped_column(String(64), index=True, default="")
+    detected: Mapped[list] = mapped_column(Json, default=list)  # moves as the system found them
+    corrected: Mapped[list] = mapped_column(Json, default=list)  # moves after the user's fixes
+    commands: Mapped[list] = mapped_column(Json, default=list)  # what the user typed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class EditRating(Base):
+    """A user's verdict on one aspect of a rendered edit, next to what the scorer measured."""
+
+    __tablename__ = "edit_ratings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    blueprint_id: Mapped[int] = mapped_column(ForeignKey("edit_blueprints.id"))
+    master_path: Mapped[str] = mapped_column(String(512), default="")
+    aspect: Mapped[str] = mapped_column(String(32))  # timing, shake, smooth, quality
+    value: Mapped[int] = mapped_column(Integer)  # timing/smooth/quality: 1 good, -1 bad; shake: -1 too little, 0 ok, 1 too much
+    scores: Mapped[dict] = mapped_column(Json, default=dict)  # the scorer's parts for the same edit, when known
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 _engine = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
@@ -250,6 +278,30 @@ async def add_weights(user_id: int, deltas: dict[str, float]) -> None:
                 s.add(row)
             row.value = (row.value or 0.0) + delta
         await s.commit()
+
+
+async def update_blueprint(blueprint_id: int, bp: Blueprint) -> None:
+    async with session() as s:
+        row = await s.get(EditBlueprint, blueprint_id)
+        if row:
+            row.data = bp.model_dump(mode="json")
+            await s.commit()
+
+
+async def add_move_label(**fields) -> MoveLabel:
+    async with session() as s:
+        row = MoveLabel(**fields)
+        s.add(row)
+        await s.commit()
+        return row
+
+
+async def add_rating(**fields) -> EditRating:
+    async with session() as s:
+        row = EditRating(**fields)
+        s.add(row)
+        await s.commit()
+        return row
 
 
 async def copy_database(source_url: str) -> dict[str, int]:

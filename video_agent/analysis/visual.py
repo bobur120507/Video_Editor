@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
-from scenedetect import ContentDetector, detect
+from scenedetect import ContentDetector, SceneManager, StatsManager, open_video
 
 from ..media import frame_at, iter_frames, thumb
 
@@ -30,11 +31,55 @@ class FrameTrack:
         return (self.times >= start) & (self.times < end)
 
 
+CUT_THRESHOLD = 27.0  # PySceneDetect content score
+# Steady fast motion can hover just over the threshold (McLaren velocity edits: 27-34 for several
+# frames). A real cut jumps above its neighbours or changes the picture; a detection that does
+# neither is motion. Real cuts rose 1.9x+ or changed the picture (TikTok, reel_1, reel_2; 2026-11-17).
+CUT_RISE = 1.5  # score / median of the 3 frames each side
+CONTINUOUS = 0.9  # thumbnail similarity of the frames either side: the same picture, still moving
+# While fast motion keeps the score above the threshold, PySceneDetect registers no new cut, even a
+# clear one (McLaren v11: 68.5 and 64.3 among frames at 30-35, cuts at 1.87 s and 2.17 s missed).
+# Peaks this far above their neighbours are added back.
+MISSED_RISE = 1.8
+
+
 def detect_cuts(path: str | Path, fps: float) -> list[float]:
     """Shot-change timestamps (seconds), excluding 0."""
-    scenes = detect(str(path), ContentDetector(threshold=27.0, min_scene_len=max(3, int(fps * 0.12))))
-    cuts = [round(s[0].seconds, 3) for s in scenes[1:]]
-    return [c for c in cuts if not _same_picture(path, c, fps)]
+    min_len = max(3, int(fps * 0.12))
+    video = open_video(str(path))
+    stats = StatsManager()
+    manager = SceneManager(stats)
+    manager.add_detector(ContentDetector(threshold=CUT_THRESHOLD, min_scene_len=min_len))
+    manager.detect_scenes(video)
+    score = np.array([float(stats.get_metrics(k, ["content_val"])[0] or 0.0) for k in range(video.frame_number)])
+
+    def rise(i: int) -> float:
+        around = np.concatenate([score[max(1, i - 3):i], score[i + 1:i + 4]])
+        return float(score[i] / max(np.median(around), 1e-6)) if len(around) else math.inf
+
+    cuts = []
+    for scene in manager.get_scene_list()[1:]:
+        i = scene[0].frame_num
+        if _same_picture(path, i / fps, fps):
+            continue
+        if rise(i) < CUT_RISE and _continuous(path, i, fps):
+            # Motion, not a cut, unless the real jump sits next to it (the detector fired on the
+            # motion just before a cut, or a frame late): then the cut is there.
+            near = [j for j in range(max(1, i - 1), min(len(score), i + min_len + 1))
+                    if j != i and score[j] >= CUT_THRESHOLD and rise(j) >= CUT_RISE]
+            if not near:
+                continue
+            i = max(near, key=lambda j: score[j])
+        cuts.append(round(i / fps, 3))
+    taken = [round(c * fps) for c in cuts]
+    for i in range(min_len + 1, len(score) - 1):  # like the library: no cut in the opening frames (fade-ins)
+        if score[i] < CUT_THRESHOLD or score[i] < score[i - 1] or score[i] < score[i + 1] or rise(i) < MISSED_RISE:
+            continue
+        if any(abs(i - j) < min_len for j in taken) or _same_picture(path, i / fps, fps) or _continuous(path, i, fps):
+            continue
+        cuts.append(round(i / fps, 3))
+        taken.append(i)
+    return sorted(set(cuts))
 
 
 def flash_aware_cuts(path: str | Path, cuts: list[float], flashes: list[float], fps: float) -> list[float]:
@@ -62,6 +107,12 @@ def flash_length(track: FrameTrack, flash: float, fps: float) -> int:
         if v - base <= 0.1 * max(peak - base, 1e-3):
             return int(min(max(i, 2), 0.5 * fps))
     return int(0.5 * fps)
+
+
+def _continuous(path: str | Path, i: int, fps: float) -> bool:
+    """True when frame i shows the same picture as the frame before it (moving, not cut)."""
+    before, at = frame_at(path, max(0, i - 1) / fps, width=240), frame_at(path, i / fps, width=240)
+    return before is not None and at is not None and float(thumb(before) @ thumb(at)) > CONTINUOUS
 
 
 def _same_picture(path: str | Path, cut: float, fps: float, before_frames: int = 2, after_frames: int = 4) -> bool:

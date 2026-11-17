@@ -13,6 +13,7 @@ from .blueprint import Blueprint, TextOverlay
 from .config import get_settings
 from .director import EditPlan, plan_edit
 from .render import RenderOptions, RenderResult, render
+from .render.engine import SYNC_OFFSET
 from .tweak import apply_adjustments, effect_intensity
 
 log = logging.getLogger(__name__)
@@ -84,6 +85,10 @@ async def apply(
     music: str | None = None,
     adjustments: dict[str, float] | None = None,
     use_preferences: bool = True,
+    blur: str = "auto",
+    sync_offset_frames: int = SYNC_OFFSET,
+    upscale: bool = True,
+    velocity: bool = True,
 ) -> ApplyOutcome:
     brand = await storage.get_brand(user_id)
     prefs = await learned_preferences(user_id) if use_preferences else {}
@@ -95,6 +100,10 @@ async def apply(
         music_path=music,
         font_path=brand.font_path if brand else None,
         effect_intensity=effect_intensity(adj),
+        blur=blur,
+        sync_offset_frames=sync_offset_frames,
+        upscale=upscale,
+        velocity=velocity,
     )
     async with _slots():
         plan = await asyncio.to_thread(plan_edit, bp, clips)

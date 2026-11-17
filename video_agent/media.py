@@ -164,8 +164,13 @@ def frame_at(path: str | Path, t: float, width: int | None = None) -> np.ndarray
     return frame
 
 
+QUANTILES = (0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+
+
 def color_stats(frames: list[np.ndarray]) -> dict:
-    """Mean colour statistics over BGR frames, all in 0..1."""
+    """Mean colour statistics over BGR frames, all in 0..1; Lab (L 0..100) means, spreads and the
+    distributions of lightness and of colourfulness (distance from the mean colour), for grading; and
+    the neutral point (the tint of the greys and whites) with colourfulness measured from it."""
     if not frames:
         return {"luma_mean": 0.45, "luma_std": 0.22, "saturation": 0.35, "rgb_mean": (0.45, 0.45, 0.45)}
     lab = np.concatenate([cv2.cvtColor(f.astype(np.float32) / 255, cv2.COLOR_BGR2LAB).reshape(-1, 3) for f in frames])
@@ -185,6 +190,27 @@ def color_stats(frames: list[np.ndarray]) -> dict:
         "rgb_mean": tuple(float(x) for x in np.mean(rgb, axis=0)),
         "lab_mean": tuple(round(float(x), 4) for x in lab.mean(axis=0)),
         "lab_std": tuple(round(float(x), 4) for x in lab.std(axis=0)),
+        "l_quantiles": tuple(round(float(x), 3) for x in np.quantile(lab[:, 0], QUANTILES)),
+        "chroma_quantiles": tuple(round(float(x), 3) for x in np.quantile(
+            np.hypot(lab[:, 1] - lab[:, 1].mean(), lab[:, 2] - lab[:, 2].mean()), QUANTILES)),
+        **_neutral(lab),
+    }
+
+
+def _neutral(lab: np.ndarray) -> dict:
+    """The tint of the greys and whites (least colourful quarter of the mid-tones) and colourfulness
+    measured from it. A video's average colour is mostly its content (grass, a blue car); its greys
+    show the grade."""
+    mid = (lab[:, 0] > 15) & (lab[:, 0] < 92)
+    if mid.sum() < 100:
+        return {}
+    c = np.hypot(lab[:, 1], lab[:, 2])
+    grey = mid & (c <= np.quantile(c[mid], 0.25))
+    n = lab[grey, 1:].mean(axis=0)
+    return {
+        "neutral_ab": tuple(round(float(x), 4) for x in n),
+        "neutral_chroma_quantiles": tuple(round(float(x), 3) for x in np.quantile(
+            np.hypot(lab[:, 1] - n[0], lab[:, 2] - n[1]), QUANTILES)),
     }
 
 

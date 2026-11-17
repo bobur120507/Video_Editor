@@ -15,28 +15,39 @@ from ..config import get_settings
 from ..media import color_stats, constant_fps_copy, extract_audio, ffmpeg, iter_frames, probe, sha256_file, thumb
 from .audio import analyze_audio
 from .camera import estimate_curves_and_blur
-from .events import detect_hits, extract_events
+from .events import detect_hits, extract_events, link_whips, sync_target
+from .transitions import find_portals
+from .velocity import edit_style, segment_velocity, sharpness
 from .visual import detect_cuts, find_flashes, flash_aware_cuts, flash_length, segment_features, track_frames
 
 log = logging.getLogger(__name__)
 
 MIN_SHOT = 0.15
+LOW_RES, LOW_RATE = 720, 1.2e6  # below this size (shorter side) or bits/s a reference has been recompressed
 
 
 def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint:
     settings = get_settings()
+    notes: list[str] = []
+    original = probe(path)
+    rate = Path(path).stat().st_size * 8 / max(original.duration, 0.1)
+    if min(original.display_size) < LOW_RES or rate < LOW_RATE:
+        w, h = original.display_size
+        notes.append(
+            f"⚠️ Low-quality reference ({w}x{h}, {rate / 1e6:.1f} Mb/s): downloader bots and Telegram 'video' messages "
+            "recompress videos. Paste the original TikTok/Instagram link, or send the video as a File, for the best match."
+        )
     path = constant_fps_copy(path, settings.dir("references"))
     info = probe(path)
     digest = sha256_file(path)
-    notes: list[str] = []
 
     audio = AudioInfo()
     if info.has_audio:
         with tempfile.TemporaryDirectory() as tmp:
             wav = extract_audio(path, Path(tmp) / "a.wav")
             res = analyze_audio(wav)
-            hits = detect_hits(wav) if res.has_music else []
-        audio = AudioInfo(bpm=res.bpm, beats=res.beats, drops=res.drops, hits=hits, has_music=res.has_music)
+            hits, kinds = detect_hits(wav) if res.has_music else ([], [])
+        audio = AudioInfo(bpm=res.bpm, beats=res.beats, drops=res.drops, hits=hits, hit_kinds=kinds, has_music=res.has_music)
         if res.has_music:
             track = settings.dir("tracks") / f"{digest[:16]}.m4a"
             if not track.exists():
@@ -51,23 +62,28 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
     cuts = flash_aware_cuts(path, detect_cuts(path, info.fps), flashes, info.fps)
 
     bounds = _shot_bounds(cuts, info.duration)
+    audio.sync_to = sync_target([a for a, _ in bounds[1:]], audio.hits, audio.hit_kinds, info.fps)
     motion_ref = float(np.percentile(track.flow, 90)) if track.flow.size else 1.0
-    curves, shutter = estimate_curves_and_blur(path, bounds, info.fps)
+    curves, shutter, softness = estimate_curves_and_blur(path, bounds, info.fps)
+    style = edit_style(track.flow, sharpness(path, info.fps))
+    if style == "velocity":
+        notes.append("Velocity edit: speed ramps between hits and motion that never stops; it needs footage that moves.")
 
     feats = [segment_features(track, start, end, motion_ref) for start, end in bounds]
     held = float(np.median([f["dup_ratio"] for f in feats])) if feats else 0.0
     if held > 0.2:
         notes.append(f"Footage repeats frames throughout ({held:.0%}, e.g. animation on twos); slow-mo judged against that.")
 
+    portals = find_portals(path, [a for a, _ in bounds[1:]], info.fps)
     segments: list[Segment] = []
-    for (start, end), curve, feat in zip(bounds, curves, feats):
+    for (start, end), curve, feat, soft in zip(bounds, curves, feats, softness):
         slowmo = feat["moving"] and feat["dup_ratio"] > max(0.3, held + 0.25)
         # Zoom/shake are carried by the camera curve itself; these flags are only a fallback.
         effects = [] if len(curve) > 1 else [e for e, on in (("zoom_punch", feat["zoom_in"]), ("shake", feat["shake"])) if on]
         if any(start + 0.15 < f < end - 0.05 for f in flashes):
             effects.append("flash")
         at_start = [f for f in flashes if abs(f - start) <= 0.15]
-        transition = "flash" if at_start else "cut"
+        transition = "flash" if at_start else "portal" if start in portals else "cut"
         speed = [SpeedPoint(at=0.0, speed=0.5)] if slowmo else [SpeedPoint(at=0.0, speed=1.0)]
         segments.append(
             Segment(
@@ -79,6 +95,8 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
                 motion=round(feat["motion"], 3),
                 camera=curve if len(curve) > 1 else None,
                 flash_frames=flash_length(track, at_start[0], info.fps) if at_start else 0,
+                blur=soft,
+                velocity=segment_velocity(track.flow, start, end, info.fps),
             )
         )
 
@@ -97,6 +115,7 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
 
     for seg in segments:
         seg.events = extract_events(seg, audio.hits)
+    link_whips(segments)
     if vision.available():
         _describe_shots(segments, frames)
     else:
@@ -124,6 +143,7 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
         output=output_for(*info.display_size),
         tier=tier,
         motion_blur=shutter,
+        style=style,
         notes=notes,
     )
 

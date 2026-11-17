@@ -11,7 +11,9 @@ import numpy as np
 
 from .blueprint import Blueprint, Segment
 from . import vision
-from .analysis.visual import detect_cuts
+from .advice import filming_advice, velocity_advice
+from .analysis.camera import estimate_curves
+from .analysis.visual import detect_cuts, track_frames
 from .media import Probe, color_stats, frame_at, iter_frames, probe, thumb
 
 log = logging.getLogger(__name__)
@@ -21,6 +23,12 @@ _FACE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_d
 
 CONTENT_MATCH = 0.8  # thumbnail correlation above which a clip is treated as the reference's own footage
 THUMB_ZOOMS = (1.0, 1.2, 1.45, 1.75)  # reference shots are often zoomed in (punches, push-ins)
+# A shot must not look like any of the last few: the McLaren edit used the same wheel close-up at
+# 1.57 s and 2.17 s (one shot apart), and the cut between near-identical pictures doesn't read as a
+# cut. Repeats cost REPEAT_PENALTY on the next shot, fading to nothing RECENT_SHOTS shots later.
+RECENT_SHOTS = 3
+REPEAT_PENALTY = 0.6
+LOOKS_SAME = 0.85  # thumbnail similarity above which two windows show the same picture (as visual._same_picture)
 
 
 @dataclass
@@ -32,6 +40,23 @@ class ClipInfo:
     cut_after: np.ndarray  # (N,) True where a new shot starts in this footage
     sem_times: np.ndarray = field(default_factory=lambda: np.zeros(0))  # CLIP samples (3 per second)
     sem: np.ndarray = field(default_factory=lambda: np.zeros((0, 512)))
+    sharp: np.ndarray = field(default_factory=lambda: np.zeros(0))  # per frame at `times`: 1 = as sharp as the clip gets
+    subj_h: np.ndarray = field(default_factory=lambda: np.zeros(0))  # at `sem_times`: main subject's height (0 = none)
+    subj_c: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))  # ... and its centre
+
+    def subject_between(self, start: float, end: float) -> tuple[float, tuple[float, float] | None]:
+        """Median subject height in the window (0 when it is mostly absent) and its centre."""
+        m = (self.sem_times >= start) & (self.sem_times < end) if len(self.subj_h) else np.zeros(0, bool)
+        if not m.any():
+            return 0.0, None
+        h = self.subj_h[m]
+        if (h > 0).mean() < 0.5:
+            return 0.0, None
+        return float(np.median(h[h > 0])), tuple(np.median(self.subj_c[m][h > 0], axis=0).tolist())
+
+    def sharpness_between(self, start: float, end: float) -> float:
+        m = (self.times >= start) & (self.times < end)
+        return float(self.sharp[m].mean()) if m.any() and len(self.sharp) else 1.0
 
     def semantic_at(self, t: float) -> np.ndarray | None:
         if not len(self.sem_times):
@@ -72,11 +97,12 @@ class EditPlan:
 
 def audit_clip(path: str | Path) -> ClipInfo:
     info = probe(path)
-    times, energy, thumbs = [], [], []
+    times, energy, thumbs, sharp = [], [], [], []
     prev = None
     for t, frame in iter_frames(path, sample_fps=info.fps, width=240):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         energy.append(0.0 if prev is None else float(cv2.absdiff(prev, gray).mean()))
+        sharp.append(float(cv2.Laplacian(gray, cv2.CV_32F).var()))
         times.append(t)
         thumbs.append([thumb(frame, zoom=z) for z in THUMB_ZOOMS])
         prev = gray
@@ -89,11 +115,16 @@ def audit_clip(path: str | Path) -> ClipInfo:
         cuts[0] = True
         for c in detect_cuts(path, info.fps):
             cuts[min(len(th) - 1, int(round(c * info.fps)))] = True
-    clip = ClipInfo(probe=info, times=np.array(times), motion=np.clip(norm, 0, 1), thumbs=th, cut_after=cuts)
+    sh = np.array(sharp)
+    clip = ClipInfo(probe=info, times=np.array(times), motion=np.clip(norm, 0, 1), thumbs=th, cut_after=cuts,
+                    sharp=np.clip(sh / (np.percentile(sh, 90) + 1e-6), 0, 1) if sh.size else sh)
     if vision.available():
         samples = list(iter_frames(path, sample_fps=3, width=320))
         clip.sem_times = np.array([t for t, _ in samples])
         clip.sem = vision.embed_images([f for _, f in samples])
+        boxes = [vision.detect(f) for _, f in samples]
+        clip.subj_h = np.array([b[0].h if b else 0.0 for b in boxes])
+        clip.subj_c = np.array([(b[0].cx, b[0].cy) if b else (0.5, 0.5) for b in boxes]).reshape(-1, 2)
     return clip
 
 
@@ -119,7 +150,7 @@ def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
     shots: list[Shot] = []
     used: dict[tuple[int, int], int] = {}  # (clip, source shot) -> times used
     used_ranges: list[tuple[int, float, float]] = []
-    prev_key = None
+    recent: list[tuple[tuple[int, int], np.ndarray]] = []  # (angle, picture) of the last shots, newest last
     for seg in blueprint.segments:
         need = seg.source_seconds_needed()
         found = _content_window(seg, clips, need, blueprint.source.path)
@@ -127,20 +158,22 @@ def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
             clip, start, corr = found
             length = min(need, clip.duration - start)
             shots.append(Shot(segment=seg, clip=clip, src_start=start, src_len=length, stretch=need / length, content_match=corr))
+            recent.append(((clips.index(clip), -1), _window_picture(clip, start, start + length)))
             continue
-        best = None
+        options = []
         for ci, c in enumerate(clips):
             for start, end, key_shot, score in _rank_windows(seg, c, need):
                 key = (ci, key_shot)
-                score -= 0.6 if key == prev_key else 0.0  # never the same camera angle twice in a row
+                score -= _repeat_penalty(key, _window_picture(c, start, end), recent)  # not the same picture again soon
                 score -= 0.25 * used.get(key, 0)  # spread the edit over every angle
                 score -= 0.3 if any(u == ci and start < b and a < end for u, a, b in used_ranges) else 0.0
-                if best is None or score > best[0]:
-                    best = (score, c, start, end, key)
-        _, clip, start, end, key = best
+                options.append((score, c, start, end, key))
+        if seg.transition_in == "portal":
+            options = _prefer_wheels(options)
+        _, clip, start, end, key = max(options, key=lambda o: o[0])
         used[key] = used.get(key, 0) + 1
         used_ranges.append((key[0], start, end))
-        prev_key = key
+        recent.append((key, _window_picture(clip, start, end)))
         length = end - start
         shots.append(Shot(segment=seg, clip=clip, src_start=start, src_len=length, stretch=need / length))
 
@@ -148,7 +181,76 @@ def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
         shot.center, shot.stats = _subject_and_color(shot)
 
     missing = _missing_shots(blueprint, have, needed)
+    if vision.available() and not missing:
+        # Footage is long enough but may not show what the reference shows: shot-by-shot advice.
+        missing = filming_advice(blueprint, shots, _footage_curves(shots))
+    if blueprint.style == "velocity" and (line := velocity_advice(blueprint, _footage_motion(clips))):
+        missing = [line, *missing]
     return EditPlan(shots=shots, warnings=warnings, missing=missing)
+
+
+# A portal shot opens on a wheel (the TikTok's: a wheel close-up). CLIP is nearly always sure it sees
+# a wheel, even head-on where the wheels hide in shadow, so the wheel's size decides: full bonus from
+# a radius of BIG_WHEEL of the frame width (a close-up), little for a distant one.
+WHEEL_BONUS = 0.8
+BIG_WHEEL = 0.12
+WHEEL_CANDIDATES = 20  # best-ranked windows checked for a wheel (CLIP on ~100 patches each, ~4 s)
+
+
+def _prefer_wheels(options: list[tuple]) -> list[tuple]:
+    """Re-rank the best windows for a wheel-portal shot by how clearly their first frame shows a wheel."""
+    from .render.transitions import wheel
+
+    top = sorted(options, key=lambda o: o[0], reverse=True)[:WHEEL_CANDIDATES]
+    out = []
+    for score, clip, start, end, key in top:
+        frame = frame_at(clip.path, start + 0.02, width=540)
+        _, circle = wheel(frame) if frame is not None else (0.0, None)
+        size = circle[2] / frame.shape[1] if circle else 0.0
+        out.append((score + WHEEL_BONUS * min(1.0, size / BIG_WHEEL), clip, start, end, key))
+    return out
+
+
+def _window_picture(clip: ClipInfo, start: float, end: float) -> np.ndarray:
+    """Unit-norm content thumbnail of a footage window (its frames' thumbnails averaged)."""
+    if len(clip.thumbs) == 0:
+        return np.zeros(256, np.float32)
+    m = (clip.times >= start) & (clip.times < max(end, start + 1e-3))
+    th = clip.thumbs[m, 0] if m.any() else clip.thumbs[[int(np.argmin(np.abs(clip.times - start)))], 0]
+    v = th.mean(axis=0)
+    return v / (np.linalg.norm(v) + 1e-9)
+
+
+def _repeat_penalty(key: tuple[int, int], picture: np.ndarray, recent: list[tuple[tuple[int, int], np.ndarray]]) -> float:
+    """Penalty for showing the same angle, or a picture that looks the same, as one of the last
+    RECENT_SHOTS shots: full on the next shot, fading with distance."""
+    worst = 0.0
+    for d, (k, pic) in enumerate(reversed(recent[-RECENT_SHOTS:]), start=1):
+        if k == key or float(picture @ pic) > LOOKS_SAME:
+            worst = max(worst, REPEAT_PENALTY * (1 - (d - 1) / RECENT_SHOTS))
+    return worst
+
+
+def _footage_motion(clips: list[ClipInfo]) -> float:
+    """Typical motion of the footage (px/frame at 160 px width, like the reference's Segment.velocity)."""
+    flows = []
+    for c in clips:
+        try:
+            flows.append(track_frames(c.path, c.probe.fps).flow[1:])
+        except Exception as e:  # advice is optional; never fail the edit over it
+            log.warning("footage motion for advice failed: %s", e)
+    return float(np.median(np.concatenate(flows))) if flows and sum(map(len, flows)) else 1e9
+
+
+def _footage_curves(shots: list[Shot]) -> list:
+    out = []
+    for shot in shots:
+        try:
+            out.append(estimate_curves(shot.clip.path, [(shot.src_start, shot.src_start + shot.src_len)], shot.clip.probe.fps, width=320)[0])
+        except Exception as e:  # advice is optional; never fail the edit over it
+            log.warning("camera estimate for advice failed: %s", e)
+            out.append(None)
+    return out
 
 
 def _content_window(seg: Segment, clips: list[ClipInfo], need: float, reference: str = "") -> tuple[ClipInfo, float, float] | None:
@@ -239,7 +341,9 @@ def _rank_windows(seg: Segment, clip: ClipInfo, need: float) -> list[tuple[float
     shot_end = np.empty(n)
     for sid in np.unique(shot_id):
         idx = np.where(shot_id == sid)[0]
-        shot_end[idx] = clip.times[idx[-1]] + 1 / fps
+        # Up to the angle's last frame, not the next angle's first: with the speed ramp's rounding that frame
+        # showed up as a one-frame flash of the next angle at the end of the McLaren v13 edit (9.80 s).
+        shot_end[idx] = clip.times[idx[-1]]
     span = max(1, int(round(need * fps)))
     starts = np.arange(0, max(1, n - min(span, n - 1)), max(1, int(fps // 10)))
     if seg.thumbs:
@@ -261,6 +365,13 @@ def _rank_windows(seg: Segment, clip: ClipInfo, need: float) -> list[tuple[float
         e = min(n, st + span)
         motion = (cum[e] - cum[st]) / max(1, e - st)
         score = float(framing[j]) - abs(motion - seg.motion) - 0.8 * max(0.0, 1 - length / need)
+        # Sharp, in-focus moments: soft or shaky stretches look like low quality once enlarged.
+        crisp = clip.sharpness_between(t0, end)
+        score += 0.6 * crisp - (0.5 if crisp < 0.35 else 0.0)
+        if seg.subject is not None and len(clip.subj_h):
+            # The subject at about the reference's size needs no digital zoom to match (which softens).
+            h, _ = clip.subject_between(t0, end)
+            score += 0.6 * max(0.0, 1 - abs(np.log(h / seg.subject.h))) if h > 0 else -0.4
         if ref_sem is not None:
             sem = clip.semantic_at(t0 + length / 2)
             if sem is not None:
@@ -314,7 +425,10 @@ def _subject_and_color(shot: Shot) -> tuple[tuple[float, float], dict]:
         if len(faces):
             x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
             centers.append(((x + w / 2) / f.shape[1], (y + h / 2) / f.shape[0]))
-    center = tuple(np.median(np.array(centers), axis=0).tolist()) if centers else (0.5, 0.5)
+    if centers:
+        center = tuple(np.median(np.array(centers), axis=0).tolist())
+    else:  # no face: the main subject (car, person, ...) when the detector found one
+        center = shot.clip.subject_between(shot.src_start, end)[1] or (0.5, 0.5)
     return center, color_stats(frames)
 
 

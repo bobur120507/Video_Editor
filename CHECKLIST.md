@@ -4,7 +4,7 @@ Status of every roadmap item. `[x]` done and tested · `[~]` partly done · `[ ]
 Updated after each milestone. The **core goal is matching the cloned video's edit as closely as possible**, so the
 Matching Engine sections come first; publishing comes last.
 
-Last updated: 2026-11-13 (milestone: edit-move translation, music sync, subject framing, YOLOX + CLIP)
+Last updated: 2026-11-17 (milestone: velocity edits P7, grade on the framed picture, cut detector)
 
 ---
 
@@ -20,7 +20,7 @@ Last updated: 2026-11-13 (milestone: edit-move translation, music sync, subject 
 |---|---|---|---|
 | reel_1: cartoon "aura" edit, 37 s, 29 shots | 76.9% → **98.9%** | 85.2% → **99.3%** | – |
 | reel_2: "Yo Jordan" looksmax edit, 23 s, 22 shots | 78.1% → **96.7%** (best 98.3%) | 78.9% → **96.4%** | – |
-| crazy_edit: pro TikTok car edit, 9.8 s, 13 shots | **99.7%** | **92.1%** | McLaren rain clip: music sync **95%**, style ~48% |
+| crazy_edit: pro TikTok car edit, 9.8 s, 13 shots | **99.7%** | **92.1%** | McLaren rain clip (velocity edit v15, transitions + neutral greys): **70.1%** (cuts 92%, timing 100%, smooth 91%, pace 76%, sharp 100%, color 21%, camera 4%; v12 71.8%, v8 per-shot tint 78.1%) |
 
 (first run → now). For the McLaren edit the literal-camera "style" number is the wrong yardstick: we now
 re-create the edit's moves (whips at the cuts, punches/shakes on the hits, push-ins) around the car instead of
@@ -43,6 +43,63 @@ most extreme radial blurs. Judge by eye: `data/real/crazy_edit/_results/tiktok_v
 Still not covered by any test: footage with moving subjects for speed ramps, on-screen text, and real raw footage.
 
 ---
+
+## Open problems (2026-11-14)
+
+Measured diagnosis of late/uneven timing, too much shake, no flow between shots and quality loss, plus the questions that need your answers: see [PROBLEMS.md](PROBLEMS.md).
+
+Done on 2026-11-14 after your answers (details and numbers in PROBLEMS.md Part 4):
+- [x] Real-ESRGAN upscaling (Intel GPU) with texture blend; bicubic warps; blur follows the reference or only fast moves; reframe zoom capped at 1.5×
+- [x] Footage windows ranked by sharpness and subject size; subject-centred crop (YOLOX) when no face
+- [x] Filming advice per shot (what it shows + camera work your footage lacks)
+- [x] Eased moves, whips carried across cuts, motion budget
+- [x] Shake = short jolts on hits (or blur bursts), no constant wobble; detection ignores smeared frames
+- [x] Hits at the drum's attack, typed kick/snare, the editor's sync drum recorded; moves land on exact frames; `--sync-offset`
+- [x] Scorer parts timing / shake / smooth / sharp
+- [x] Bot: move review with annotated preview and plain-word fixes (stored as ground truth); rating buttons (stored with scores)
+- [x] Low-quality reference warning
+- [x] Your pick from the −1/0/+1 blind test: **A = −1 frame**, now the default for every edit (`SYNC_OFFSET` in `render/engine.py`; `--sync-offset 0` for exactly on the hit)
+- [x] Smoothness (P7) steps 1–7 built (PROBLEMS.md Part 5): velocity/calm style check, smooth in-shot speed ramps with real smear, never-stopping drift, motion calibration, Real-ESRGAN only on sharp frames, `flow` score, "film moving footage" advice; `--no-velocity` to turn off
+- [x] P7 step 8: McLaren test edit rendered (`velocity_test/mclaren_velocity.mp4`): shake 85→100%, flow 11→20%, render 22→16 min; timing, cuts and sharp got worse, overall 56.1→53.7% (PROBLEMS.md)
+- [x] Fixed after the test: time map was a frame late; whips 2× the reference's (0.45→0.25); smear shutter 270°→180°; render temp files on the data disk, cleaned per shot
+- [x] Second velocity test edit (`velocity_test/mclaren_velocity_v2.mp4`): overall **59.1%** (best so far; previous 56.1%), cuts 88%, timing 96%, smooth 0→18%
+- [x] Found the remaining spikes (whips 7× in-shot motion vs the TikTok's 2×; cut frames) and the extra smear (copied 360° camera blur on 74% of frames: 94% of those smeared), PROBLEMS.md
+- [x] Fix: velocity shots blur only fast camera moves (≤180°); whips calibrated to 1.9× in-shot motion (the TikTok's own ratio) with a gentler ease. Modelled: whips 10.6× → 1.9×, camera blur 74% → 27% of frames
+- [x] Third velocity test edit (`velocity_test/mclaren_velocity_v3.mp4`): overall **63.8%** (best so far), flow 21→74%, sharp 85→100%, fast÷typical 7.2→3.8×; smooth 18→1% (jerk fell, but mean motion fell more)
+- [x] Fix: drift sways inside its caps (pan curves, push and roll ease back and forth). Modelled: long shots 0.55–0.73 → 1.87–2.19 px/frame (targets ~1.9–2.2), typical motion 1.32 → 2.34 (TikTok 2.06)
+- [x] Fourth velocity test edit (`velocity_test/mclaren_velocity_v4.mp4`): overall **66.5%** (best so far), smooth 1→70%, flow 74→89%, sharp 100%; cuts 88→76% (punches now read as cuts)
+- [x] Fix: velocity punches attack over 3 frames (35/75/100%, biggest step still on the hit). Modelled: biggest zoom step 0.112 → 0.082; aims at the false cuts at 3.93s and 4.27s (the ones at 5.57s and 7.53s are steady fast drift at the detector's threshold)
+- [x] Fifth velocity test edit (`velocity_test/mclaren_velocity_v5.mp4`): overall **70.0%** (best so far), smooth 70→97%, cuts 76→82%, timing 100%; punch false cuts gone
+- [x] Found why camera (4%) and color (32%) score low: the camera moves in different directions from the TikTok's (standing still would score 15%; ceiling within quality caps ~38%); the grade is measured before the camera zooms into the dark car (zoomed shots up to 21 brightness points too dark), and saturation is capped at 2×
+- [x] Fix: grade measured on the framed picture (camera decided first). Modelled: zoomed shots' brightness on target (4.93s 20 → 40, TikTok 40)
+- [x] Tried drift following the TikTok's camera path: modelled camera 4.9 → 5.9% with rougher motion, dropped (ceiling ~15% on different footage; standing still scores 14.9%)
+- [x] Sixth velocity test edit (`velocity_test/mclaren_velocity_v6.mp4`): overall 69.7% (v5 70.0%); color 32→43% (brightness fixed), cuts 82→73% (3 more false cuts on steady motion in the brightened shots)
+- [x] Cut detector: a weak detection on a continuous picture is motion, not a cut (moves to the real jump when one is next to it). TikTok, reel_1, reel_2 unchanged; v5/v6 false cuts gone. Re-scored: v6 **73.4%** (best), v5 72.0%, cuts 92%. Benchmark 97.8% (was 97.7%), cuts 100%
+- [x] Found where v6's remaining colour miss comes from: 80% grade strength (~0.4 of 1.87) and stages after the grade (~0.45); the LUT is exact, the saturation cap barely matters
+- [x] Colour: velocity edits grade at 100% (your call). One-shot test: 2.97s 1.88 → 1.55, 4.93s 1.45 → 0.85; motion blur is not the loss; the linear grade clips the black car's shadows (contrast) and can't make grey footage colourful (saturation)
+- [x] Colour: the grade matches lightness and colourfulness distributions (quantiles) instead of mean/spread. On McLaren stills through the real LUT path: colour miss 1.04 → 0.88, yellow cast gone, pixels crushed to black 8.6% → 0.7%, blown to white 3.0% → 0%. Benchmark 97.8% → 98.0% (colour 95.2 → 95.7%)
+- [x] Seventh velocity test edit (`velocity_test/mclaren_velocity_v7.mp4`): overall **76.7%** (best so far), color 43→66%, cuts 92%; one shot (3.10–4.93s) came out too dark
+- [x] Fix: the slope-limited brightness curve keeps the target's average (that shot on stills: 32.6 → 42.2, TikTok 42.6; whole edit colour miss 0.88 → 0.81). Benchmark 98.0%
+- [x] Eighth velocity test edit (`velocity_test/mclaren_velocity_v8.mp4`): overall **77.2%** (best so far), color 66→70%; the dark shot fixed (brightness 32.6 → 43.3, TikTok 42.6). What's left of colour is contrast (2.5× stretch limit)
+- [x] Your v8 review: colours jump shot to shot because each shot copies its TikTok shot's content-driven colours; measured the score vs consistency trade-off (PROBLEMS.md Part 6)
+- [x] Region-aware grade tried on stills: worse score (2.1–3.5 vs 0.80) and coloured speckles on the black car, not built
+- [x] Colour consistency (your call): one tint for every shot in velocity edits. v9 (`velocity_test/mclaren_velocity_v9.mp4`): tint jumps 6.8 → 1.9, overall 77.2 → 74.0% (colour 70 → 48%)
+- [x] Your v9 review (colours off after 4 s): v9 gave grey roads a teal cast. Greys now go to the TikTok's greys plus half its average tint (your pick). v10 (`velocity_test/mclaren_velocity_v10.mp4`): 72.8%, roads grey again
+- [x] Your v10 review (blue rises at 3–5 s): frame-by-frame (5/s) analysis; cause: copied content tint + bluer source shots. Fix built: one colour transform for the whole edit, greys to the TikTok's greys, colourfulness ≤1.6×, shot matching
+- [x] Eleventh velocity test edit (`velocity_test/mclaren_velocity_v11.mp4`): cyan cast gone (red−green −10…−15 → −2…−6 per second), greys near neutral; overall 70.2% (colour 29%: no longer copies the TikTok's content colours)
+- [x] Director: no repeated picture within 3 shots (same angle or a look-alike window); 2.17s no longer repeats the wheel close-up
+- [x] Cut detector: adds back clear cuts PySceneDetect skips while motion keeps its score above the threshold. v5–v11 now find all 12 cuts (1.87s was missed since v3); TikTok and reel_2 unchanged, reel_1 +1 real cut. Re-scored: v11 70.2 → 72.0%, cuts 96%
+- [x] Twelfth velocity test edit (`velocity_test/mclaren_velocity_v12.mp4`): 71.8%, no repeated footage, all 12 cuts detected; scripts kept in `velocity_test/scripts/`
+- [x] Your v12 review (blue at 3–4 s): the grade moved our greys to the TikTok's teal greys; greys now stay neutral (`keep_greys`). Street shot 2.97s: blue−red +3.8 → +0.9
+- [x] Detached transitions: corner panel, wheel portal, car cut-out rendered across cuts (no download needed: CLIP finds the wheel, GrabCut cuts out the car). Portal detected automatically (1 hit, 0 false alarms on 3 references); panel and cut-out marked in the move review. Director picks a wheel shot for a portal
+- [x] Thirteenth velocity test edit (`velocity_test/mclaren_velocity_v13.mp4`): all three transitions rendered (portal closest to the TikTok); 67.0% (67.9% re-scored). Fixed after: portal and cut-out start 5 frames before the cut, detector counts cuts 3 frames apart, footage windows end before the clip's own cuts
+- [x] Fourteenth velocity test edit (`velocity_test/mclaren_velocity_v14.mp4`): 70.1%, cuts 92%; portal on time; after it, the rim frame between the two flashes fixed (stills)
+- [x] Where the remaining points are (v14): camera (14 pts, footage-bound) and colour tint (12 pts, the TikTok's content colours you chose not to copy); contrast and hue-selective colour tried on stills, too small or bluer, not built. Ceiling with this footage ≈72–75%
+- [x] Polish, fifteenth velocity test edit (`velocity_test/mclaren_velocity_v15.mp4`): 70.1%, pace 72 → 76%; portal is an iris around the still previous shot, cut-out fades in and grows (4.80s still reads as a cut)
+- [ ] Detect corner panels and car cut-outs automatically (needs more reference edits to learn from)
+- [ ] P7 follow-up if still jerky: rebuild moves as one spline path instead of bumps on the drift
+- [ ] 5 more reference edits (you), then tune detection on them and the move reviews
+- [ ] Faster upscaling (22 min render): tile tuning or upscale only the used frames once per clip
 
 ## Beating human editors: the gaps, in priority order
 

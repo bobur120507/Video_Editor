@@ -162,7 +162,7 @@ def test_events_snap_punches_to_hits_and_cap_push():
     seg = Segment(start=10.0, end=11.0, camera=curve)
     events = extract_events(seg, hits=[10.52])
     punches = [e for e in events if e.kind == "punch"]
-    assert len(punches) == 1 and punches[0].t == pytest.approx(0.52)  # moved onto the hit
+    assert len(punches) == 1 and punches[0].t == pytest.approx(16 / 30, abs=1e-3)  # moved onto the hit's frame
     assert not extract_events(seg, hits=[12.0]) or all(e.kind != "punch" for e in extract_events(seg, hits=[12.0]))
 
 
@@ -173,11 +173,11 @@ def test_synthesized_whip_and_reframe_put_subject_in_place():
     from video_agent.render.motion import _matrix, reframe, synthesize
     from video_agent.vision import Box
 
-    curve, whip = synthesize([EditEvent(kind="whip_out", t=1.0, strength=1.0, dx=1.0)], 30, 30)
-    assert whip[-3:].all() and not whip[:-3].any()
-    assert curve.x[-1] > 0.3 and abs(curve.x[0]) < 1e-9  # smears out at the end only
+    curve, whip, fast = synthesize([EditEvent(kind="whip_out", t=1.0, strength=1.0, dx=1.0)], 30, 30)
+    assert whip[-4:].all() and not whip[:-4].any() and fast[-4:].all()
+    assert curve.x[-1] == pytest.approx(0.25) and abs(curve.x[0]) < 1e-9  # smears out at the end only
 
-    still, _ = synthesize([], 1, 30)
+    still, _, _ = synthesize([], 1, 30)
     out = reframe(still, Subject(cls="car", cx=0.4, cy=0.6, w=0.7, h=0.3), Box("car", 0.9, 0.4, 0.55, 0.6, 0.7), 1080, 1920)
     p = _matrix(out.s[0], out.r[0], out.x[0], out.y[0], 1080, 1920) @ np.array([540, 1200, 1])
     assert (p[0] / 1080, p[1] / 1920) == pytest.approx((0.4, 0.6), abs=1e-3)
@@ -193,3 +193,380 @@ def test_vision_models_find_a_car_and_describe_it(samples):
     assert texts.shape == (2, 512) and np.allclose(np.linalg.norm(texts, axis=1), 1, atol=1e-3)
     frame = np.full((640, 360, 3), 128, np.uint8)
     assert vision.detect(frame) == []  # nothing to find in a flat grey frame
+
+
+def test_hits_are_timed_at_the_attack_and_typed(tmp_path):
+    import numpy as np
+    import soundfile as sf
+
+    from video_agent.analysis.events import detect_hits
+
+    sr = 22050
+    y = np.zeros(sr * 4, np.float32)
+    starts = [0.5, 1.25, 2.0, 2.75, 3.5]
+    for k, t in enumerate(starts):
+        n = np.arange(int(0.25 * sr))
+        if k % 2 == 0:  # kick: low thump
+            burst = np.sin(2 * np.pi * 60 * n / sr) * np.exp(-n / (0.06 * sr))
+        else:  # snare/clap: noise burst
+            burst = np.random.default_rng(k).normal(0, 0.5, len(n)) * np.exp(-n / (0.03 * sr))
+        i = int(t * sr)
+        y[i : i + len(n)] += burst.astype(np.float32)
+    sf.write(tmp_path / "a.wav", y, sr)
+    hits, kinds = detect_hits(tmp_path / "a.wav", keep=1.0)
+    for t in starts:
+        assert min(abs(h - t) for h in hits) < 0.02  # within ~half a frame of where the sound starts
+    by_time = {round(min(starts, key=lambda s: abs(s - h)), 2): k for h, k in zip(hits, kinds)}
+    assert by_time[0.5] == "kick" and by_time[1.25] == "snare"
+
+
+def test_moves_land_on_the_hit_frame_and_ease():
+    import numpy as np
+
+    from video_agent.blueprint import EditEvent
+    from video_agent.render.motion import synthesize
+
+    fps = 30
+    seg_start = 2.0
+    punch = EditEvent(kind="punch", t=0.5, strength=0.2, zoom=1.0)
+    curve, _, fast = synthesize([punch], 40, fps, seg_start)
+    s = np.log(curve.s)
+    hit = round((seg_start + 0.5) * fps) - round(seg_start * fps)
+    assert s[hit - 1] == 0 and s[hit] > 0.1 and s[hit + 1] == pytest.approx(0.2)  # impact on the hit frame
+    assert fast[hit] and not fast[hit + 3]
+    assert s[hit + 3] < s[hit + 1] and s[-1] == pytest.approx(0, abs=1e-6)  # eased back to rest
+
+    early, _, _ = synthesize([punch], 40, fps, seg_start, offset_frames=-1)
+    assert np.log(early.s)[hit - 1] > 0.1  # one frame early when asked
+
+    from video_agent.render.motion import VELOCITY_PUNCH_ATTACK
+
+    flowing, _, _ = synthesize([punch], 40, fps, seg_start, punch_attack=VELOCITY_PUNCH_ATTACK)
+    step = np.diff(np.log(flowing.s), prepend=0.0)
+    assert int(np.argmax(step)) == hit  # velocity punches still land on the hit...
+    assert step.max() < 0.65 * np.diff(s, prepend=0.0).max()  # ...but flow in over 3 frames (40% steps, not 65%)
+
+    jolt = EditEvent(kind="shake", t=0.5, duration=0.25, strength=1.0)
+    curve, _, _ = synthesize([jolt], 40, fps, seg_start)
+    d = np.hypot(curve.x, curve.y)
+    assert d[:hit].max() == 0 and d[hit] == d.max()  # biggest jolt exactly on the hit
+    assert d[hit + int(0.25 * fps) + 2 :].max() < 0.15 * d[hit]  # and gone soon after: no constant wobble
+
+
+def test_whip_out_continues_into_the_next_shot():
+    from video_agent.analysis.events import link_whips
+    from video_agent.blueprint import EditEvent
+
+    a = Segment(start=0, end=1, events=[EditEvent(kind="whip_out", t=1.0, strength=0.8, dx=1.0, dy=0.0)])
+    b = Segment(start=1, end=2)
+    c = Segment(start=2, end=3, events=[EditEvent(kind="whip_out", t=1.0, strength=0.4, dx=0.0, dy=1.0)])
+    d = Segment(start=3, end=4, events=[EditEvent(kind="whip_in", t=0.0, strength=1.0, dx=1.0, dy=0.0)])
+    link_whips([a, b, c, d])
+    carried = b.events[0]
+    assert carried.kind == "whip_in" and carried.source == "carried" and carried.dx == 1.0 and carried.strength == pytest.approx(0.4)
+    out, inn = c.events[0], d.events[0]
+    assert (out.dx, out.dy) == (inn.dx, inn.dy) and out.strength == inn.strength == 1.0  # one shared direction and speed
+
+
+def test_blur_follows_the_reference_or_only_fast_moves():
+    import numpy as np
+
+    from video_agent.blueprint import Blueprint, SourceInfo
+    from video_agent.render.engine import RenderOptions, _shutter
+
+    seg = Segment(start=0, end=0.2, blur=[0.0, 0.9, 0.9, 0.1, 0.0, 0.0])
+    bp = Blueprint(source=SourceInfo(duration=1, fps=30, width=1080, height=1920), segments=[seg], motion_blur=1.0)
+    fast = np.array([1, 0, 0, 0, 0, 1], bool)
+    assert list(_shutter(seg, bp, RenderOptions(), 6, fast)) == [0, 1, 1, 0, 0, 0]  # blurred where the reference is
+    assert list(_shutter(seg, bp, RenderOptions(blur="fast_only"), 6, fast)) == [1, 0, 0, 0, 0, 1]
+    assert _shutter(seg, bp, RenderOptions(blur="off"), 6, fast) == 0.0
+    bp.motion_blur = 0.0
+    assert list(_shutter(seg, bp, RenderOptions(blur="fast_only"), 6, fast)) == [0.5, 0, 0, 0, 0, 0.5]  # no reference blur: 180° on whips
+    bp.motion_blur = 1.0
+    # Velocity shots: the smear comes from the speed ramp, the camera blurs only its fast moves (180° at most)
+    assert list(_shutter(seg, bp, RenderOptions(), 6, fast, velocity=True)) == [0.5, 0, 0, 0, 0, 0.5]
+
+
+def test_user_corrections_fix_the_detected_moves():
+    from video_agent import labels
+    from video_agent.blueprint import AudioInfo, Blueprint, CameraCurve, EditEvent, SourceInfo
+
+    cam = CameraCurve(fps=30, s=[1.0] * 30, r=[0.0] * 30, x=[0.0] * 30, y=[0.0] * 30)
+    segs = [
+        Segment(start=0, end=1, camera=cam, events=[EditEvent(kind="punch", t=0.5, strength=0.2, zoom=1.0), EditEvent(kind="whip_out", t=1.0, strength=1, dx=1)]),
+        Segment(start=1, end=2, camera=cam, events=[EditEvent(kind="whip_in", t=0.0, strength=1, dx=1), EditEvent(kind="shake", t=0.4, duration=0.2, strength=0.5)]),
+    ]
+    bp = Blueprint(source=SourceInfo(duration=2, fps=30, width=1080, height=1920), segments=segs, audio=AudioInfo(hits=[1.7]))
+    assert [m.kind for m in labels.moves(bp)] == ["punch", "whip", "shake"]
+    fixed, done = labels.apply_corrections(bp, "remove 2; 3 punch, add 1.65 shake")
+    assert len(done) == 3
+    kinds = [(m.kind, m.t) for m in labels.moves(fixed)]
+    assert ("whip", 1.0) not in kinds and ("punch", 1.4) in kinds and ("shake", 1.7) in kinds  # 1.65 snapped to the hit
+    assert all(e.source == "user" for s in fixed.segments for e in s.events if e.kind == "shake")
+    assert labels.is_ok("All correct") and not labels.is_ok("remove 1")
+
+
+def test_style_tells_velocity_edits_from_calm_ones():
+    import numpy as np
+
+    from video_agent.analysis.velocity import edit_style, segment_velocity
+
+    rng = np.random.default_rng(0)
+    moving = 2 + np.sin(np.arange(300) / 2.5) + rng.random(300) * 0.3  # never stops, rises and falls
+    calm = np.where(np.arange(300) % 30 < 20, 0.01, 2.0)  # still between moves
+    assert edit_style(moving, np.full(300, 0.13)) == "velocity"
+    assert edit_style(moving, np.full(300, 0.55)) == "calm"  # moving but sharp: a calm edit with a moving camera
+    assert edit_style(calm, np.full(300, 0.13)) == "calm"
+    v = segment_velocity(np.r_[np.zeros(10), 9.0, np.ones(20)], 10 / 30, 1.0, 30)
+    assert len(v) == 20 and max(v) < 2  # the cut's own jump is not motion
+
+
+def test_velocity_time_map_ramps_smoothly_and_uses_the_planned_footage():
+    import numpy as np
+
+    from video_agent.render import velocity as vel
+
+    wave = list(1.4 + np.cos(np.arange(45) * 2 * np.pi / 14))  # hits every 14 frames: slow on them, fast between
+    speed = vel.speed_curve(wave, 45, 1.2)
+    p = vel.time_map(speed, 30)
+    assert np.all(np.diff(p) > 0)  # never runs backwards
+    assert p[-1] + speed[0] / 30 == pytest.approx(45 / 30 * 1.2)  # exactly the source the Director planned
+    assert np.diff(p) * 30 == pytest.approx(speed[1:])  # motion into each frame is that frame's own speed: not a frame late
+    assert speed.min() < 0.8 * 1.2 < 1.25 * 1.2 < speed.max()  # a real ramp
+    assert np.abs(np.diff(speed)).max() < 0.35 * speed.mean()  # eased, no steps
+    # smear: a fast frame blends several source frames, a slow one shows one
+    assert len(vel.sample_points(0.0, 3.0, 30, 30)) >= 3 and len(vel.sample_points(0.0, 0.3, 30, 30)) == 1
+    frames = [np.full((4, 4, 3), k * 5, np.uint8) for k in range(40)]
+    out = list(vel.retime(lambda k: frames[k], 40, np.array([0.0, 0.5]), np.array([3.0, 0.3]), 30, 30))
+    assert 2 < out[0].mean() < 12 and out[1].mean() == 75  # averaged sweep over 1.5 frames; one crisp frame
+    need = vel.sharp_frames(p, speed, 30, 30, 60)
+    assert 0 < need.sum() < 60  # only the frames that land sharp get AI upscaling
+
+
+def test_drift_never_stops_and_calibration_matches_the_reference_motion():
+    import numpy as np
+
+    from video_agent.blueprint import EditEvent
+    from video_agent.render import velocity as vel
+    from video_agent.render.motion import drift_directions, synthesize
+
+    n = 40
+    wave = vel.wave([2, 1, 0.5, 1, 2, 3] * 7, n)
+    events = [EditEvent(kind="punch", t=0.5, strength=0.15, zoom=1.0)]
+    curve, _, _ = synthesize(events, n, 30, 0.0, 0, wave, 0.0, 2.0, 0.5)
+    cam = vel.camera_flow(curve, n, 1080, 1920)
+    assert cam.min() > 0.05  # the camera never stands still
+    plain, _, _ = synthesize(events, n, 30)
+    same, _, _ = synthesize(events, n, 30, 0.0, 0, None, 0.0, 0.0, 1.0)
+    assert plain.s == same.s and plain.x == same.x  # calm edits are untouched
+
+    still = np.full(n, 0.14)  # McLaren-like footage that barely moves
+    build = lambda a, g: synthesize(events, n, 30, 0.0, 0, wave, 0.0, a, g)[0]  # noqa: E731
+    amp, gain, got, ratio = vel.calibrate(build, still, 0.6, 2.6, n, 1080, 1920)
+    assert 0 < amp < vel.AMPS[-1] and got == pytest.approx(0.6, rel=0.15)  # reachable: matched
+    amp, _, got_max, _ = vel.calibrate(build, still, 5.0, 2.6, n, 1080, 1920)
+    assert got_max > got  # out of reach without moving footage: as close as the quality limits allow
+
+    segs = [Segment(start=0, end=1), Segment(start=1, end=2, events=[EditEvent(kind="whip_in", t=0, strength=0.8, dx=0.0, dy=1.0)]),
+            Segment(start=2, end=3)]
+    d = drift_directions(segs)
+    assert d[0.0] == 0.0 and d[1.0] == pytest.approx(np.pi / 2) and d[2.0] == d[1.0]  # carries on across the cut
+
+
+def test_long_shots_keep_drifting_inside_the_quality_caps():
+    import math
+
+    import numpy as np
+
+    from video_agent.render import velocity as vel
+    from video_agent.render.motion import DRIFT_TRAVEL, DRIFT_ZOOM_TRAVEL, drift_path
+
+    n = 60
+    wave = vel.wave([2, 1, 0.5, 1, 2, 3] * 10, n)
+    for amp in (1.0, 4.0):
+        x, y, zoom, roll = drift_path(wave, 0.3, amp)
+        assert np.ptp(x) <= DRIFT_TRAVEL + 1e-6 and np.ptp(y * 16 / 9) <= DRIFT_TRAVEL + 1e-6
+        assert zoom.min() >= 0 and zoom.max() <= DRIFT_ZOOM_TRAVEL + 1e-6
+        assert np.abs(roll).max() <= math.radians(1.5) + 1e-6
+    moving = lambda amp: np.median(np.hypot(np.diff(drift_path(wave, 0.3, amp)[0]), np.diff(drift_path(wave, 0.3, amp)[1] * 16 / 9)))  # noqa: E731
+    assert moving(4.0) > 3.5 * moving(1.0)  # 4x the drift moves ~4x faster: curves, does not stop at the cap
+
+
+def test_grade_matches_lightness_and_colourfulness_distributions():
+    import cv2
+    import numpy as np
+
+    from video_agent.blueprint import ColorProfile
+    from video_agent.media import color_stats
+    from video_agent.render.grade import _match_colour, _match_lightness
+
+    rng = np.random.default_rng(0)
+    grey = np.clip(rng.normal(60, 25, (64, 64, 3)) * [1, 1, 1], 0, 255).astype(np.uint8)  # dark, colourless footage
+    grey[:32] = np.clip(grey[:32] * 0.25, 0, 255).astype(np.uint8)  # half of it a black car
+    vivid = np.clip(rng.normal(120, 60, (64, 64, 3)), 0, 255).astype(np.uint8)  # bright, contrasty, colourful look
+    src, tgt = color_stats([grey]), ColorProfile(**color_stats([vivid]))
+    lab = cv2.cvtColor(grey.astype(np.float32) / 255, cv2.COLOR_BGR2LAB).reshape(-1, 3)
+    L = _match_lightness(lab[:, 0], np.array(src["l_quantiles"]), np.array(tgt.l_quantiles))
+    assert np.all(np.diff(L[np.argsort(lab[:, 0])]) >= -1e-6)  # keeps the order of tones
+    assert (L <= 0.5).mean() < 0.02 and L.std() > lab[:, 0].std()  # more contrast, shadows not crushed to black
+    a, b = _match_colour(lab[:, 1], lab[:, 2], src["lab_mean"], np.array(src["chroma_quantiles"]), tgt.lab_mean,
+                         np.array(tgt.chroma_quantiles))
+    before = np.hypot(lab[:, 1] - lab[:, 1].mean(), lab[:, 2] - lab[:, 2].mean()).mean()
+    assert np.hypot(a - a.mean(), b - b.mean()).mean() > 2 * before  # grey footage gets colourful
+
+
+def test_every_shot_gets_the_edits_tint():
+    from types import SimpleNamespace
+
+    from video_agent.blueprint import Blueprint, ColorProfile, SourceInfo
+    from video_agent.render.engine import _target_color
+
+    look = ColorProfile(lab_mean=(45.0, -5.0, -3.0), lab_std=(30.0, 8.0, 10.0))
+    blue_shot = ColorProfile(lab_mean=(35.0, -2.0, -12.0), lab_std=(28.0, 9.0, 14.0))  # a blue car close-up
+    bp = Blueprint(source=SourceInfo(duration=1, fps=30, width=1080, height=1920), segments=[], color=look)
+    shot = SimpleNamespace(segment=SimpleNamespace(color=blue_shot), content_match=0.0)
+    tinted = _target_color(shot, bp, one_tint=True)
+    assert tinted.lab_mean[1:] == look.lab_mean[1:]  # the edit's tint, not the blue car's
+    assert tinted.lab_mean[0] == _target_color(shot, bp).lab_mean[0] == 0.75 * 35 + 0.25 * 45  # brightness still per shot
+
+
+def test_neutral_point_reads_the_grade_not_the_content():
+    import numpy as np
+
+    from video_agent.media import color_stats
+
+    frame = np.zeros((100, 60, 3), np.uint8)
+    frame[:60] = (40, 160, 50)  # mostly green grass (BGR)
+    frame[60:] = (130, 128, 125)  # a grey road, very slightly warm
+    st = color_stats([frame])
+    assert st["lab_mean"][1] < -15  # the average is the grass...
+    assert abs(st["neutral_ab"][0]) < 2 and abs(st["neutral_ab"][1]) < 3  # ...the neutral point is the road
+
+
+def test_director_does_not_repeat_a_picture_within_a_few_shots():
+    import numpy as np
+
+    from video_agent.director import REPEAT_PENALTY, _repeat_penalty
+
+    wheel, front, side = np.eye(3)
+    recent = [((0, 1), wheel), ((0, 2), front)]  # the wheel close-up, then the front
+    assert _repeat_penalty((0, 1), wheel, recent) == REPEAT_PENALTY * (1 - 1 / 3)  # the wheel again, one shot later
+    assert _repeat_penalty((0, 3), wheel, recent) > 0  # another angle that looks the same counts too
+    assert _repeat_penalty((0, 3), side, recent) == 0  # something new is free
+    assert _repeat_penalty((0, 1), wheel, recent + [((0, 3), side)] * 3) == 0  # long ago: free again
+
+
+def test_detached_transitions_composite_two_shots():
+    import numpy as np
+
+    from video_agent.analysis.transitions import shrinking_circle
+    from video_agent.render.transitions import cutout_frame, panel_frame, portal_frame
+
+    a = np.full((320, 180, 3), 40, np.uint8)  # previous shot: dark
+    b = np.full((320, 180, 3), 200, np.uint8)  # next shot: bright
+    assert panel_frame(a, b, 0.1, 0.0).mean() < 80  # a small window of the next shot at the corner...
+    assert panel_frame(a, b, 1.0, 0.85).mean() > 190  # ...that grows to the whole frame
+    assert panel_frame(a, b, 0.4, 0.3)[5, 175].mean() > panel_frame(a, b, 0.4, 0.3)[315, 5].mean()  # from the top right
+
+    wheel = (90.0, 220.0, 20.0)
+    assert portal_frame(a, b, 0.0, wheel).mean() < 60  # zoomed into the wheel: its opening (the previous shot) fills the frame
+    end = portal_frame(a, b, 1.0, wheel)
+    assert end[30, 90].mean() > 190 and end[220, 90].mean() < 60  # zoomed out: the next shot, the opening at the wheel
+    assert portal_frame(a, b, 1.0, wheel, flash=1.0)[220, 90].mean() > 190  # the white flash in the opening
+
+    mask = np.zeros((320, 180), np.float32)
+    mask[150:250, 40:140] = 1  # the next shot's car
+    assert np.array_equal(cutout_frame(a, b, mask, 0.0, 0.0), a)  # still below the frame
+    landed = cutout_frame(a, b, mask, 1.0, 0.9)
+    assert landed[200, 90].mean() > 150 and landed[50, 90].mean() < 60  # the car in place, the background still the previous shot
+
+    shrinking = [(90, 160, r) for r in (130, 128, 115, 100, 80, 52, 30)]
+    assert shrinking_circle(shrinking, 216)  # the portal's signature
+    assert not shrinking_circle([(90, 160, r) for r in (60, 62, 59, 61, 60, 58, 60)], 216)  # a wheel that just sits there
+    assert not shrinking_circle([(90, 160, 130), None, (20, 30, 40), None, (150, 200, 90)], 216)  # unrelated circles
+
+
+def test_grade_measures_the_framed_picture():
+    import numpy as np
+
+    from video_agent.blueprint import CameraCurve
+    from video_agent.render.compositor import framed
+
+    frame = np.full((320, 180, 3), 220, np.uint8)
+    frame[110:210, 50:130] = 10  # a black car in the middle of a bright street
+    push = CameraCurve(fps=30, s=[1.6] * 10, r=[0.0] * 10, x=[0.0] * 10, y=[0.0] * 10)
+    seen = framed([(0, frame)], push, 1080, 1920, 30, 10, centre=False)[0]
+    assert seen.shape == frame.shape and seen.mean() < frame.mean() - 20  # pushed in: the car fills more of it
+    still = framed([(0, frame)], CameraCurve(fps=30, s=[1.0] * 10, r=[0.0] * 10, x=[0.0] * 10, y=[0.0] * 10), 1080, 1920, 30, 10,
+                   centre=False)[0]
+    assert np.abs(still.astype(int) - frame).max() <= 1
+
+
+def test_velocity_whips_speed_up_out_of_the_drift():
+    import numpy as np
+
+    from video_agent.blueprint import EditEvent
+    from video_agent.render import velocity as vel
+    from video_agent.render.motion import VELOCITY_WHIP_EASE, synthesize
+
+    n = 40
+    wave = vel.wave([1.0] * n, n)
+    events = [EditEvent(kind="whip_out", t=1.2, strength=1.0, dx=1.0)]
+    full, whips, _ = synthesize(events, n, 30, 0.0, 0, wave, 0.0, 1.0, 1.0)
+    gentle, _, _ = synthesize(events, n, 30, 0.0, 0, wave, 0.0, 1.0, 1.0, 1.0, VELOCITY_WHIP_EASE)
+    assert gentle.x[-1] == pytest.approx(full.x[-1])  # same travel...
+    last = lambda c: abs(c.x[-1] - c.x[-2]) / abs(c.x[-1] - c.x[-5])  # noqa: E731
+    assert last(gentle) < last(full)  # ...less of it on the last frame
+
+    segs = [Segment(start=0, end=1, velocity=[1.0] * 26 + [2.0] * 4, events=events)]
+    assert vel.whip_ratio(segs, 4) == pytest.approx(2.0)
+    assert vel.whip_ratio([Segment(start=0, end=1)], 4) == vel.WHIP_RATIO  # nothing to measure
+
+    still = np.full(n, 0.14)
+    build = lambda g: synthesize(events, n, 30, 0.0, 0, wave, 0.0, 1.0, 1.0, g, VELOCITY_WHIP_EASE)[0]  # noqa: E731
+    cam = vel.camera_flow(build(1.0), n, 1080, 1920)
+    calm = float(np.median(cam[~whips]))
+    assert np.median(cam[whips]) > 4 * calm  # at full travel whips jump far out of the drift
+    g, got = vel.calibrate_whips(build, still, 2.0 * calm, whips, n, 1080, 1920)
+    assert g < 1.0 and got == pytest.approx(2.0 * calm, rel=0.2)  # calibrated: twice the shot's motion
+
+
+def test_flow_score_and_advice_for_velocity_templates():
+    import numpy as np
+
+    from video_agent.advice import velocity_advice
+    from video_agent.scoring import _flow
+
+    wave = 2 + np.sin(np.arange(300) * 2 * np.pi / 14)
+    hits = np.arange(1, 20) * 14 / 30
+    spikes = 0.2 + np.where(np.arange(300) % 14 == 0, 8.0, 0.0)  # still, then bursts: what we used to make
+    assert _flow(wave, wave, hits, 30)[0] == pytest.approx(1.0)
+    assert _flow(wave, spikes, hits, 30)[0] < 0.5
+
+    bp = _bp([Segment(start=0, end=1, velocity=[2.0] * 30)])
+    assert velocity_advice(bp, 1.5) is None  # calm template: nothing to say
+    bp.style = "velocity"
+    assert velocity_advice(bp, 1.5) is None  # footage moves enough
+    assert "14x less" in velocity_advice(bp, 0.14)
+
+
+def test_velocity_render_ramps_smears_and_drifts(samples, tmp_path, caplog):
+    import logging
+
+    import numpy as np
+
+    from video_agent.render import RenderOptions
+
+    ref, raw = samples
+    bp = clone_video(ref)
+    bp.style = "velocity"
+    for seg in bp.segments:
+        n = round(seg.duration * 30)
+        seg.velocity = [round(2 + 1.5 * np.cos(i * 2 * np.pi / 14), 3) for i in range(n)]  # slow on hits, fast between
+        seg.camera = None
+    caplog.set_level(logging.INFO, logger="video_agent.render.engine")
+    result = render(bp, plan_edit(bp, [raw]), tmp_path / "vel.mp4", RenderOptions(interpolate_slowmo=False))
+    info = probe(result.master)
+    assert info.duration == pytest.approx(bp.duration, abs=0.1)
+    text = caplog.text
+    assert "velocity: drift" in text and "velocity retime failed" not in text

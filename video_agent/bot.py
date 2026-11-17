@@ -20,7 +20,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, CallbackQuery, FSInputFile, InputMediaPhoto, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from . import meta, storage
+from . import labels, meta, storage
 from .captions import format_caption, generate_caption
 from .config import get_settings
 from .downloader import download, find_url, instagram_shortcode
@@ -51,6 +51,7 @@ HELP = (
 
 class CloneFlow(StatesGroup):
     waiting_source = State()
+    review = State()  # the user checks the moves the cloner found
     waiting_name = State()
 
 
@@ -81,6 +82,11 @@ class Tpl(CallbackData, prefix="tpl"):
 
 class Act(CallbackData, prefix="act"):
     action: str
+
+
+class Rate(CallbackData, prefix="rate"):
+    aspect: str  # timing, shake, smooth, quality
+    value: int
 
 
 # ---------------------------------------------------------------- helpers
@@ -133,6 +139,39 @@ def _after_render_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="📝 Caption", callback_data=Act(action="caption"))
     kb.button(text="💾 Save as template", callback_data=Act(action="save_variant"))
+    return kb.as_markup()
+
+
+RATINGS = [
+    ("timing", [("🎵 On the beat", 1), ("🎵 Off the beat", -1)]),
+    ("shake", [("Shake: too little", -1), ("Shake: right", 0), ("Shake: too much", 1)]),
+    ("smooth", [("〰️ Smooth", 1), ("〰️ Jerky", -1)]),
+    ("quality", [("🖼 Sharp", 1), ("🖼 Blurry/low quality", -1)]),
+]
+
+
+def _rating_keyboard():
+    kb = InlineKeyboardBuilder()
+    for aspect, choices in RATINGS:
+        for text, value in choices:
+            kb.button(text=text, callback_data=Rate(aspect=aspect, value=value))
+    kb.adjust(2, 3, 2, 2)
+    return kb.as_markup()
+
+
+MOVES_HELP = (
+    "Is this right? Watch the video: each move I found shows its number when it happens.\n"
+    "Reply in plain words, for example:\n"
+    "  remove 3 5 – those are not moves\n"
+    "  4 shake – #4 is a shake (kinds: shake, punch, whip/slide, flash, slow zoom, slow-mo)\n"
+    "  add 2.4 punch – a move I missed, at 2.4 s (the time is at the bottom of the video)\n"
+    "or tap ✅ when it's correct."
+)
+
+
+def _moves_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ All correct", callback_data=Act(action="moves_ok"))
     return kb.as_markup()
 
 
@@ -192,9 +231,63 @@ async def _run_clone(message: Message, state: FSMContext, bot: Bot, url: str | N
         log.exception("clone failed")
         await status.edit_text(f"❌ Could not analyze that video: {e}")
         return
+    warnings = "".join(f"\n\n{n}" for n in bp.notes if n.startswith("⚠️"))
+    await status.edit_text(f"✅ Editing DNA extracted\n\n{bp.summary()}{warnings}")
+    await state.update_data(blueprint_id=row.id, detected=labels.snapshot(bp), commands=[])
+    if not labels.moves(bp):
+        await _ask_template_name(message, state)
+        return
+    await state.set_state(CloneFlow.review)
+    await _send_moves(message, bp, job)
+
+
+async def _send_moves(message: Message, bp, job: Path, text: str = ""):
+    try:
+        from .render.engine import _default_font
+
+        video = await asyncio.to_thread(labels.annotate, bp, bp.source.path, job / f"moves_{uuid.uuid4().hex[:6]}.mp4", _default_font())
+        await message.answer_video(FSInputFile(video), caption="Moves I found, numbered on screen", supports_streaming=True)
+    except Exception:
+        log.exception("annotated preview failed")
+    await message.answer(f"{text}{labels.as_text(bp)}\n\n{MOVES_HELP}", reply_markup=_moves_keyboard())
+
+
+@router.message(CloneFlow.review, TEXT)
+async def moves_fix(message: Message, state: FSMContext):
+    if labels.is_ok(message.text):
+        await _moves_done(message, state, message.from_user.id)
+        return
+    data = await state.get_data()
+    row = await storage.get_blueprint(data["blueprint_id"])
+    bp, done = labels.apply_corrections(row.blueprint, message.text)
+    if not done:
+        await message.answer("I didn't understand that. " + MOVES_HELP, reply_markup=_moves_keyboard())
+        return
+    await storage.update_blueprint(row.id, bp)
+    await state.update_data(commands=[*data.get("commands", []), message.text])
+    job = _job_dir(message.from_user.id)
+    await _send_moves(message, bp, job, "Got it: " + "; ".join(done) + "\n\n")
+
+
+@router.callback_query(CloneFlow.review, Act.filter(F.action == "moves_ok"))
+async def moves_ok(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await _moves_done(cb.message, state, cb.from_user.id)
+
+
+async def _moves_done(message: Message, state: FSMContext, user_id: int):
+    data = await state.get_data()
+    row = await storage.get_blueprint(data["blueprint_id"])
+    bp = row.blueprint
+    # Every review is ground truth for move detection, confirmed or corrected.
+    await storage.add_move_label(user_id=user_id, blueprint_id=row.id, source_sha256=bp.source.sha256,
+                                 detected=data.get("detected", []), corrected=labels.snapshot(bp), commands=data.get("commands", []))
+    await _ask_template_name(message, state)
+
+
+async def _ask_template_name(message: Message, state: FSMContext):
     await state.set_state(CloneFlow.waiting_name)
-    await state.update_data(blueprint_id=row.id)
-    await status.edit_text(f"✅ Editing DNA extracted\n\n{bp.summary()}\n\nName this template (e.g. car_phonk_v1):")
+    await message.answer("Name this template (e.g. car_phonk_v1):")
 
 
 @router.message(CloneFlow.waiting_name, TEXT)
@@ -399,24 +492,40 @@ async def _render_and_send(message: Message, state: FSMContext, user_id: int, bp
     if data.get("template_id"):
         await storage.bump_template_usage(data["template_id"], preview_path=str(r.preview))
     await state.set_state(ApplyFlow.feedback)
-    await state.update_data(version=version, rendered_blueprint_id=rendered_row.id, fingerprint_id=fp.id)
+    await state.update_data(version=version, rendered_blueprint_id=rendered_row.id, fingerprint_id=fp.id, master=str(r.master), scores={})
     tail = ("\n\n" + "\n".join(notes)) if notes else ""
     await message.answer(
         "Want changes? Just type them, e.g. “darker, faster cuts, more zoom, bigger text”." + tail,
         reply_markup=_after_render_keyboard(),
     )
+    await message.answer("How is it? One tap per row helps me learn your taste:", reply_markup=_rating_keyboard())
     reference = outcome.blueprint.source.path
     if reference and Path(reference).exists():
-        asyncio.create_task(_send_match_score(message, reference, r.master))
+        asyncio.create_task(_send_match_score(message, state, reference, r.master))
 
 
-async def _send_match_score(message: Message, reference: str, output: Path):
+async def _send_match_score(message: Message, state: FSMContext, reference: str, output: Path):
     """Measure how closely the edit matches the reference (runs after delivery; takes ~a video length)."""
     try:
         report = await asyncio.to_thread(style_match, reference, output)
         await message.answer("📏 " + report.text())
+        if (await state.get_data()).get("master") == str(output):
+            await state.update_data(scores=report.parts)
     except Exception:
         log.exception("match scoring failed")
+
+
+@router.callback_query(Rate.filter())
+async def rate_edit(cb: CallbackQuery, callback_data: Rate, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("rendered_blueprint_id"):
+        await cb.answer("That edit is no longer open; rate the latest one.", show_alert=True)
+        return
+    await storage.add_rating(user_id=cb.from_user.id, blueprint_id=data["rendered_blueprint_id"], master_path=data.get("master", ""),
+                             aspect=callback_data.aspect, value=callback_data.value, scores=data.get("scores", {}))
+    if callback_data.aspect == "shake" and callback_data.value:
+        await storage.add_weights(cb.from_user.id, {"effects": -0.5 * callback_data.value})  # less/more shake next time
+    await cb.answer("Thanks, noted 👍")
 
 
 @router.message(ApplyFlow.feedback, TEXT)

@@ -55,13 +55,16 @@ def estimate_curves(path: str | Path, bounds: list[tuple[float, float]], fps: fl
     return _estimate(path, bounds, fps, width)[0]
 
 
-def estimate_curves_and_blur(path: str | Path, bounds: list[tuple[float, float]], fps: float, width: int = 480) -> tuple[list[CameraCurve], float]:
-    """Curves plus the editor's motion-blur shutter (0 = none, 0.5 = 180°, 1.0 = 360° heavy blur).
+def estimate_curves_and_blur(path: str | Path, bounds: list[tuple[float, float]], fps: float, width: int = 480
+                             ) -> tuple[list[CameraCurve], float, list[list[float]]]:
+    """Curves, the editor's motion-blur shutter (0 = none, 0.5 = 180°, 1.0 = 360° heavy blur) and,
+    per shot, how soft each frame is next to the shot's sharpest one (0 crisp .. 1 smeared).
 
     Within each shot, the sharpness of the fastest-moving third of frames is compared with the
     slowest third (pro edits rarely hold still, so there may be no truly still frames).
     """
     curves, sharp = _estimate(path, bounds, fps, width)
+    softness = [[round(float(np.clip(1 - v / (max(sh) + 1e-6), 0, 1)), 2) for v in sh] for sh in sharp]
     ratios = []
     for curve, sh in zip(curves, sharp):
         speeds = _corner_speeds(curve, width, width * 16 / 9)
@@ -72,9 +75,9 @@ def estimate_curves_and_blur(path: str | Path, bounds: list[tuple[float, float]]
         k = len(speeds) // 3
         ratios.append(float(np.median(sh[order[-k:]]) / (np.median(sh[order[:k]]) + 1e-6)))
     if not ratios:
-        return curves, 0.0
+        return curves, 0.0, softness
     r = float(np.median(ratios))
-    return curves, 1.0 if r < 0.5 else 0.5 if r < 0.75 else 0.0
+    return curves, 1.0 if r < 0.5 else 0.5 if r < 0.75 else 0.0, softness
 
 
 def _corner_speeds(curve: CameraCurve, w: float, h: float) -> np.ndarray:
@@ -191,7 +194,8 @@ def _estimate(path, bounds, fps, width):
     only spoil itself. Transforms are relative to that sharpest frame.
     """
     frames: list[list[np.ndarray]] = [[] for _ in bounds]
-    for t, frame in iter_frames(path, sample_fps=fps, width=width):
+    span = (max(0.0, min(a for a, _ in bounds) - 1 / fps), max(b for _, b in bounds) + 1 / fps) if bounds else (0.0, None)
+    for t, frame in iter_frames(path, sample_fps=fps, width=width, start=span[0], end=span[1]):
         idx = next((i for i, (a, b) in enumerate(bounds) if a - 0.5 / fps <= t < b - 0.5 / fps), None)
         if idx is not None:
             frames[idx].append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))

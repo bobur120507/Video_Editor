@@ -15,6 +15,7 @@ from .config import get_settings
 from .downloader import download, find_url
 from .llm import configured_providers
 from .pipeline import apply, clone
+from .render.engine import SYNC_OFFSET
 from .tweak import parse_feedback
 
 LOCAL_USER = 0  # templates made from the CLI belong to this user id
@@ -46,7 +47,9 @@ async def cmd_apply(args) -> None:
         print(f"Tweaks: {adjustments}")
     out = Path(args.out or get_settings().dir("outputs") / f"{args.template}_{len(list(get_settings().dir('outputs').glob('*.mp4')))}.mp4")
     print("Rendering…")
-    outcome = await apply(LOCAL_USER, bp, args.clips, out, texts=args.text, music=args.music, adjustments=adjustments)
+    outcome = await apply(LOCAL_USER, bp, args.clips, out, texts=args.text, music=args.music, adjustments=adjustments,
+                          blur=args.blur, sync_offset_frames=args.sync_offset, upscale=not args.no_upscale,
+                          velocity=not args.no_velocity)
     await storage.bump_template_usage(tpl.id)
     for w in outcome.plan.warnings:
         print(f"warning: {w}")
@@ -139,6 +142,13 @@ def main() -> None:
     p.add_argument("--music", help="Audio file to use instead of the template's track")
     p.add_argument("--tweak", help='Natural-language changes, e.g. "darker, more zoom"')
     p.add_argument("--out")
+    p.add_argument("--blur", choices=["auto", "fast_only", "off"], default="auto",
+                   help="Motion blur: follow the reference (auto), only on whips/punches (fast_only), or none")
+    p.add_argument("--sync-offset", type=int, default=SYNC_OFFSET,
+                   help=f"Move beat-synced moves by N frames (default {SYNC_OFFSET} = one frame early, 0 = on the hit)")
+    p.add_argument("--no-upscale", action="store_true", help="Skip Real-ESRGAN for low-resolution footage (faster)")
+    p.add_argument("--no-velocity", action="store_true",
+                   help="Velocity templates: no speed ramps or drifting camera (render like a calm edit)")
     p.set_defaults(fn=cmd_apply)
 
     sub.add_parser("templates", help="List saved templates").set_defaults(fn=cmd_templates)
