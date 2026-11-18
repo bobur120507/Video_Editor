@@ -26,7 +26,7 @@ from .. import vision
 from ..analysis.camera import estimate_curves, register_curve
 from ..analysis.visual import track_frames
 from .compositor import apply_camera, framed, is_static, relative_curve
-from . import transitions
+from . import glow, transitions
 from .motion import (PUNCH_ATTACK, VELOCITY_PUNCH_ATTACK, VELOCITY_WHIP_EASE, WHIP_EASE, WHIP_FRAMES, drift_directions, reframe,
                      synthesize)
 from . import velocity as vel
@@ -81,6 +81,7 @@ class RenderOptions:
     # colour boost turns rain texture into coloured speckle (v15: 1.16 vs the TikTok's 0.85). 0:4:0:3
     # cut it by 12% with sharpness unchanged (5175 -> 5162). "" turns it off.
     chroma_denoise: str = "0:4:0:3"
+    glows: bool = True  # beat glows from the template (render/glow.py)
     effect_intensity: float = 1.0
     interpolate_slowmo: bool = True
     replay_camera: bool = True  # replay the reference's per-frame zoom/rotation/pan/shake
@@ -136,6 +137,11 @@ def render(blueprint: Blueprint, plan: EditPlan, out_path: str | Path, opts: Ren
         concat_list.write_text("".join(f"file '{p}'\n" for p in parts))
         joined = tmp / "joined.mp4"
         ffmpeg(["-f", "concat", "-safe", 0, "-i", concat_list, "-c", "copy", joined])
+        if opts.glows and blueprint.glows:
+            glowed = tmp / "glowed.mp4"
+            glow.apply(joined, glowed, blueprint.glows, spec.width, spec.height, fps, LOSSLESS)
+            joined = glowed
+            log.info("beat glows at %s", ", ".join(f"{g.t:.2f}s" for g in blueprint.glows))
 
         total = frame_cursor / fps
         _final_pass(joined, blueprint, opts, total, fps, out_path, tmp)

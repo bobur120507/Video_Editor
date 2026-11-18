@@ -93,6 +93,7 @@ apply:  Blueprint + clips ─► AI Director (motion-matched clip windows, face-
 | `video_agent/render/velocity.py` | Velocity edits: smooth in-shot speed ramps, real smear from the footage, motion calibration |
 | `video_agent/analysis/transitions.py` | Finds wheel-portal transitions in a reference (a circle that keeps shrinking around a cut) |
 | `video_agent/render/transitions.py` | Two-shot transitions across a cut: corner panel, wheel portal (CLIP finds the wheel), car cut-out (GrabCut) |
+| `video_agent/analysis/glow.py` / `render/glow.py` | Beat glows: finds where the reference turns warm and golden on a beat, re-creates it on the edit |
 | `video_agent/analysis/events.py` | Edit moves per shot (whips, punches, shake jolts, push) and the drum hits they sit on, timed at each sound's attack and typed kick/snare |
 | `video_agent/render/motion.py` | Re-creates those moves on new footage with eased keyframes, whips carried across cuts, and a motion budget |
 | `video_agent/vision.py` | YOLOX subject detection and CLIP shot understanding (ONNX, CPU) |

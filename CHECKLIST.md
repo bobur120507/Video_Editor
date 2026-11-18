@@ -20,7 +20,7 @@ Last updated: 2026-11-17 (milestone: velocity edits P7, grade on the framed pict
 |---|---|---|---|
 | reel_1: cartoon "aura" edit, 37 s, 29 shots | 76.9% → **98.9%** | 85.2% → **99.3%** | – |
 | reel_2: "Yo Jordan" looksmax edit, 23 s, 22 shots | 78.1% → **96.7%** (best 98.3%) | 78.9% → **96.4%** | – |
-| crazy_edit: pro TikTok car edit, 9.8 s, 13 shots | **99.7%** | **92.1%** | McLaren rain clip (velocity edit v16, transitions + neutral greys): **71.0%** (cuts 96%, timing 100%, smooth 92%, pace 77%, sharp 100%, color 21%, camera 4%; v12 71.8%, v8 per-shot tint 78.1%) |
+| crazy_edit: pro TikTok car edit, 9.8 s, 13 shots | **99.7%** | **92.1%** | McLaren rain clip (velocity edit v17, transitions + glows): **70.7%** (cuts 96%, timing 100%, smooth 92%, pace 77%, sharp 100%, color 21%, camera 4%; v12 71.8%, v8 per-shot tint 78.1%) |
 
 (first run → now). For the McLaren edit the literal-camera "style" number is the wrong yardstick: we now
 re-create the edit's moves (whips at the cuts, punches/shakes on the hits, push-ins) around the car instead of
@@ -98,6 +98,8 @@ Done on 2026-11-14 after your answers (details and numbers in PROBLEMS.md Part 4
 - [x] Polish, fifteenth velocity test edit (`velocity_test/mclaren_velocity_v15.mp4`): 70.1%, pace 72 → 76%; portal is an iris around the still previous shot, cut-out fades in and grows (4.80s still reads as a cut)
 - [x] More polish (not rendered): cut-out car enters at 50% size and fades in (no extra cut on a test clip); chroma-only noise reduction after the grade (colour noise −12%, sharpness unchanged). Benchmark 97.7%
 - [x] Sixteenth velocity test edit (`velocity_test/mclaren_velocity_v16.mp4`): **71.0%**, cuts 96% (no extra detections), colour noise −9%
+- [x] Beat glows: detected in the reference (the TikTok's 2, none on the reels) and rendered as a warm golden sky + highlight bloom on the same beats; in the move review ("add 8.0 glow")
+- [x] Seventeenth velocity test edit (`velocity_test/mclaren_velocity_v17.mp4`): beat glows on the TikTok's frames (4.00s, 6.77s); 70.7% (colour −1: the scorer reads the warm frames as off-colour)
 - [ ] Detect corner panels and car cut-outs automatically (needs more reference edits to learn from)
 - [ ] P7 follow-up if still jerky: rebuild moves as one spline path instead of bumps on the drift
 - [ ] 5 more reference edits (you), then tune detection on them and the move reviews

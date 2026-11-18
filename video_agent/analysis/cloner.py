@@ -16,6 +16,7 @@ from ..media import color_stats, constant_fps_copy, extract_audio, ffmpeg, iter_
 from .audio import analyze_audio
 from .camera import estimate_curves_and_blur
 from .events import detect_hits, extract_events, link_whips, sync_target
+from .glow import find_glows
 from .transitions import find_portals
 from .velocity import edit_style, segment_velocity, sharpness
 from .visual import detect_cuts, find_flashes, flash_aware_cuts, flash_length, segment_features, track_frames
@@ -113,6 +114,9 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
             seg.thumbs = [[round(float(v), 3) for v in thumb(shot[i][1])] for i in pick]
             seg.thumbs_t = [round(shot[i][0] - seg.start, 4) for i in pick]
 
+    glows = find_glows(path, info.fps, [a for a, _ in bounds[1:]], audio.hits)
+    if glows:
+        notes.append(f"Beat glows: the picture turns warm and golden on {len(glows)} beat(s).")
     for seg in segments:
         seg.events = extract_events(seg, audio.hits)
     link_whips(segments)
@@ -144,6 +148,7 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
         tier=tier,
         motion_blur=shutter,
         style=style,
+        glows=glows,
         notes=notes,
     )
 

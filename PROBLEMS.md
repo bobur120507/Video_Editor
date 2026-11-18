@@ -1036,3 +1036,54 @@ With the gentler cut-out and chroma noise reduction: tests 31 pass. Benchmark **
 ### Sixteenth velocity test edit (v16, `velocity_test/mclaren_velocity_v16.mp4`, render 19 min)
 
 **Overall 71.0%** (v15 70.1%). Cuts 92% → **96%**: all 12 real cuts, no extra detections (the cut-out no longer reads as a cut). Colour noise 1.17 → **1.06**; sharpness 4983 → 4916 (−1%, unchanged to the eye). Pace 77%, shake 100%, smooth 92%, flow 91%; colour 21% and camera 4% as before (footage-bound, see "Where the remaining points are").
+
+## Part 8: your v16 review (2026-11-18, measured, nothing built)
+
+**"Shines on the car on the beats":** the TikTok has warm glows. Its upper half turns orange-warm for a few frames 17 times, 11 of them within 0.2 s after a beat (e.g. 4.03s after the 3.98s beat, 5.67s and 5.83s after 5.55s and 5.83s). 85% of its frames have glowing, blown highlights (v16: 63%). v16 has 3 such surges, 1 on a beat. The cloner does not detect glows or light leaks, so the edit cannot re-create them. To build: detect beat-synced warm/bright surges in the reference, and render them as a glow on highlights plus a warm light sweep, timed to the same beats.
+
+**"The car doesn't stand, it switches":** measured with YOLOX on every frame, v16's car is as steady as the TikTok's, or steadier:
+- Within shots it moves 0.48% of the frame per frame (TikTok 0.58%).
+- Across cuts its centre jumps 9% of the frame (TikTok 11%).
+
+Some shots frame it at a different size: 0.00s TikTok 16% of the frame height vs ours 29%; 1.17s 59% vs 32%; 1.57s 37% vs 69%; 6.13s 90% vs 65%. That comes from what the footage contains, since the car can only be enlarged 1.5× before it goes soft. What you see as "switching" is not measured yet; your answer below will tell.
+
+**What cloning captures (the template):**
+
+| Captured | Not captured |
+|---|---|
+| Cuts (frame-exact), beats, music hits, BPM, drops | Glows, light leaks, light sweeps ("shines") |
+| Whips (slides), zoom punches, shakes, pushes, all timed to hits | Text on screen (no OCR yet) |
+| Speed ramps and the motion wave (velocity edits) | Sound effects (whooshes, impacts) |
+| Motion blur amount per frame | Radial/zoom blur, chromatic aberration, grain, vignette |
+| White flash transitions | Object animations other than the wheel portal (logos, parts detaching) |
+| Wheel portal (automatic); corner panel and car cut-out (marked in the move review) | Corner panel and car cut-out detection |
+| Per-frame camera path, per-shot colour and lightness distributions | Masks (text behind the subject), sky replacement, 3D |
+| Car position and size per shot, what each shot shows (CLIP) | |
+
+About two-thirds of what a pro editor does is captured. The rest is effects and graphics.
+
+### Beat glows (built, not rendered)
+
+**What the TikTok does**, frame by frame: on some beats the picture switches to a warm, golden look over the *same* footage, holds for 8–9 frames, and switches back. At 4.00s (beat 3.98s) its sky goes from cool (yellow −6.7) to golden (+6.6) and slightly darker; again at 6.77s (beat 6.79s). Its other warm moments are new footage after a cut, not an effect.
+
+**Detection** (`analysis/glow.py`, run by the cloner, stored as `Blueprint.glows`):
+- **Rule:** the upper half's yellow rises by more than 6 within a frame or two, the picture stays the same (similarity above 0.8), no cut within 3 frames, a music hit within 0.1 s, held 3–15 frames.
+- **Result:** exactly 4.00s and 6.77s on the TikTok, and none on reel_1 or reel_2.
+
+**Rendering** (`render/glow.py`, over the joined edit before the final pass, lossless):
+- **Warmth:** strongest at the top, fading toward the bottom.
+- **Bright areas** (the sky) take the full change, darker areas 35% of it. Spread evenly, it turned houses and trees muddy brown.
+- **Sky darkening:** at most 6 L, plus a warm highlight bloom (screen blend). It switches on at the beat and eases off over its last 2 frames.
+- **On v16's frames:** the top quarter's yellow goes 9.2 → 16.1 at 4.00s, 16.2 → 22.3 at 6.77s.
+
+It is subtler than the TikTok's, because our top is mostly house and trees, not open sky.
+
+**Move review:** glows are listed ("Glow (picture turns warm and golden on the beat)") and can be removed or added in words ("add 8.0 glow", "shine", "golden", "light leak").
+
+Tests: 32 pass. Benchmark **97.6%** (before glows: 97.7%), cuts 100%; no glows detected in its synthetic edits.
+
+### Seventeenth velocity test edit (v17, `velocity_test/mclaren_velocity_v17.mp4`, render 24 min): beat glows
+
+**Overall 70.7%** (v16 71.0%). Colour 21% → 20%: the scorer compares each shot's average colour, and the glow warms two shots for 9 frames. Cuts 96% with no extra detections; everything else unchanged.
+
+The glows land on the TikTok's own frames. The upper half's yellow jumps at 4.00s (4.9 → 9.9, held, back to 6.5 by 4.33s) and at 6.77s (12.3 → 17.4, eased off before the 7.07s cut). Frame by frame with the TikTok: `compare/glow_v17.png`. They are visibly gentler than the TikTok's golden sunset sky, because our top of frame is a house and trees, not open sky. Stronger is one setting (`render/glow.py` `MIDTONE`, `MAX_DARKEN`).

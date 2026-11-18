@@ -179,6 +179,15 @@ class ColorProfile(BaseModel):
     lut_path: str | None = None  # optional .cube LUT applied after matching
 
 
+class Glow(BaseModel):
+    """A beat glow: the picture turns warm and golden for a few frames on a music hit, then back."""
+
+    t: float  # seconds into the edit
+    frames: int
+    warm: float  # Lab b (yellow) added to the top of the frame
+    bright: float = 0.0  # Lab L added to the top of the frame
+
+
 class TextOverlay(BaseModel):
     text: str
     start: float
@@ -225,6 +234,7 @@ class Blueprint(BaseModel):
     # "velocity": never-stopping motion, speed ramps between hits, smeared (analysis/velocity.py);
     # "calm": still between moves and sharp. Old blueprints are calm.
     style: Literal["calm", "velocity"] = "calm"
+    glows: list[Glow] = Field(default_factory=list)  # beat glows, in the edit's time
     notes: list[str] = Field(default_factory=list)
 
     @property

@@ -16,7 +16,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .blueprint import Blueprint, EditEvent, Segment, SpeedPoint
+from .blueprint import Blueprint, EditEvent, Glow, Segment, SpeedPoint
 from .media import ffmpeg
 
 KIND_WORDS = {
@@ -29,11 +29,13 @@ KIND_WORDS = {
     "panel": "Corner panel (next shot grows in from a corner)",
     "portal": "Wheel portal (next shot zooms out of its wheel)",
     "cutout": "Car cut-out (next shot's car rises in)",
+    "glow": "Glow (picture turns warm and golden on the beat)",
 }
 SCREEN = {"whip": "WHIP", "punch": "PUNCH", "shake": "SHAKE", "push": "ZOOM", "flash": "FLASH", "slowmo": "SLOW-MO",
-          "panel": "PANEL", "portal": "PORTAL", "cutout": "CUT-OUT"}
+          "panel": "PANEL", "portal": "PORTAL", "cutout": "CUT-OUT", "glow": "GLOW"}
 TRANSITIONS = ("panel", "portal", "cutout")  # shown at a cut and stored as Segment.transition_in
 SYNONYMS = [
+    (r"glow|shine|shiny|golden|light ?leak|gleam", "glow"),
     (r"cut.?out|car (?:rise|fl[yi])|rises? in|detach", "cutout"),
     (r"portal|wheel|iris|circle|rim", "portal"),
     (r"panel|corner|window|picture.in", "panel"),
@@ -87,6 +89,8 @@ def moves(bp: Blueprint) -> list[Move]:
                 # Detected pushes are mostly the camera flying, on nearly every shot: listing them
                 # buries the real moves. They stay in the template; only user-added ones are listed.
                 found.append(Move(0, seg.start, "push", "in" if e.strength > 0 else "out"))
+    for g in bp.glows:
+        found.append(Move(0, g.t, "glow"))
     found.sort(key=lambda m: (m.t, m.kind))
     for n, m in enumerate(found, 1):
         m.n = n
@@ -188,6 +192,8 @@ def _remove(bp: Blueprint, move: Move) -> None:
         seg.transition_in, seg.effects = "cut", [e for e in seg.effects if e != "flash"]
     elif move.kind in TRANSITIONS:
         seg.transition_in, seg.transition_from = "cut", ""
+    elif move.kind == "glow":
+        bp.glows = [g for g in bp.glows if abs(g.t - move.t) > 0.02]
     elif move.kind == "slowmo":
         seg.speed = [SpeedPoint(at=0.0, speed=1.0)]
 
@@ -198,6 +204,9 @@ def _add(bp: Blueprint, t: float, kind: str) -> float:
     near = min(hits, key=lambda h: abs(h - t)) if hits else t
     if abs(near - t) <= SNAP:
         t = near
+    if kind == "glow":
+        bp.glows = sorted([*bp.glows, Glow(t=round(t, 3), frames=8, warm=9.0)], key=lambda g: g.t)
+        return t
     if kind in ("whip", "flash", *TRANSITIONS):
         cut = min((s.start for s in bp.segments[1:]), key=lambda c: abs(c - t), default=0.0)
         i, seg = _seg_at(bp, cut + 1e-4)

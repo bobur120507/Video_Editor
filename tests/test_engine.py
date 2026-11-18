@@ -486,6 +486,30 @@ def test_detached_transitions_composite_two_shots():
     assert not shrinking_circle([(90, 160, 130), None, (20, 30, 40), None, (150, 200, 90)], 216)  # unrelated circles
 
 
+def test_beat_glow_warms_the_sky_on_the_beat():
+    import cv2
+    import numpy as np
+
+    from video_agent import labels
+    from video_agent.blueprint import Blueprint, Glow, SourceInfo
+    from video_agent.render.glow import envelope, glow_frame
+
+    frame = np.full((320, 180, 3), 60, np.uint8)
+    frame[:120] = 225  # a bright overcast sky over a dark street
+    g = Glow(t=1.0, frames=6, warm=10.0, bright=-10.0)
+    lab = lambda f: cv2.cvtColor(f, cv2.COLOR_BGR2LAB).astype(np.float32)  # noqa: E731
+    out = glow_frame(frame, g, 1.0)
+    assert lab(out)[:120, :, 2].mean() - lab(frame)[:120, :, 2].mean() > 5  # the sky turns golden...
+    assert abs(lab(out)[250:, :, 0].mean() - lab(frame)[250:, :, 0].mean()) < 3  # ...the street keeps its brightness
+    assert np.array_equal(glow_frame(frame, g, 0.0), frame)
+    assert [envelope(k, 6) for k in (-1, 0, 3, 5, 6)] == [0.0, 1.0, 1.0, 1 / 3, 0.0]  # on at the beat, eases off
+
+    bp = Blueprint(source=SourceInfo(duration=3, fps=30, width=1080, height=1920), segments=[Segment(start=0, end=3)], glows=[g])
+    assert any(m.kind == "glow" for m in labels.moves(bp))
+    bp2, done = labels.apply_corrections(bp, "add 2.0 shine")
+    assert done and [x.t for x in bp2.glows] == [1.0, 2.0]
+
+
 def test_grade_measures_the_framed_picture():
     import numpy as np
 
