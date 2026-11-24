@@ -15,7 +15,9 @@ from pathlib import Path
 import numpy as np
 
 from ..blueprint import Blueprint
-from . import curves, timeline
+from types import SimpleNamespace
+
+from . import curves, expr, timeline
 
 FOOTAGE = {2, 7, 8, 9, 10}  # image, video placeholder, image sequence, video, image placeholder
 KINDS = {0: "precomp", 1: "solid", 5: "text", 6: "audio", 13: "camera"}
@@ -34,9 +36,9 @@ def _handle(h, dim: int) -> np.ndarray:
 class Prop:
     """One Lottie property: static ({"a":0,"k":v}) or keyframed ({"a":1,"k":[...]}), plus an optional expression."""
 
-    def __init__(self, raw: dict | None, default, fr: float, seed: int = 0):
+    def __init__(self, raw: dict | None, default, fr: float, seed: int = 0, comp: SimpleNamespace | None = None):
         raw = raw or {}
-        self.default, self.fr, self.seed = _arr(default), fr, seed
+        self.default, self.fr, self.seed, self.comp, self.failed = _arr(default), fr, seed, comp, False
         self.expr = raw.get("x") if isinstance(raw.get("x"), str) else ""
         k = raw.get("k", default)
         self.keys = k if raw.get("a") == 1 or (isinstance(k, list) and k and isinstance(k[0], dict) and "t" in k[0]) else None
@@ -78,12 +80,25 @@ class Prop:
 
     def at(self, frame: float) -> np.ndarray:
         keys = [k["t"] for k in self.keys] if self.keys else []
-        return timeline.expression(self.expr, self.raw(frame), frame, self.fr, keys, self.raw, self.seed)
+        raw = self.raw(frame)
+        if self.expr and self.comp is not None:
+            def loop(kind, n):
+                v = timeline.expression(f"loopOut('{kind}', {n})", raw, frame, self.fr, keys, self.raw)
+                return v.tolist() if v.size > 1 else float(v[0])
+
+            try:
+                v = np.atleast_1d(np.asarray(expr.evaluate(self.expr, expr.Context(raw.tolist() if raw.size > 1 else float(raw[0]),
+                                                                                   frame / self.fr, self.comp, None, loop, self.seed)), dtype=np.float64))
+                return np.concatenate([v, raw[v.size:]]) if v.size < raw.size else v[: max(raw.size, 1)]
+            except (expr.Unsupported, ValueError, TypeError):
+                self.failed = True
+        return timeline.expression(self.expr, raw, frame, self.fr, keys, self.raw, self.seed)
 
 
 class LottieLayer:
-    def __init__(self, raw: dict, fr: float, comp_w: int, comp_h: int, assets: dict, depth: int = 0):
+    def __init__(self, raw: dict, fr: float, comp_w: int, comp_h: int, assets: dict, depth: int = 0, duration: float = 0.0):
         self.raw, self.fr = raw, fr
+        comp = SimpleNamespace(width=float(comp_w), height=float(comp_h), duration=duration, frameDuration=1.0 / fr)
         ty = raw.get("ty")
         self.kind = "footage" if ty in FOOTAGE else KINDS.get(ty, "other")
         self.ind, self.parent_ind, self.parent = raw.get("ind"), raw.get("parent"), None
@@ -97,14 +112,14 @@ class LottieLayer:
         p = ks.get("p", {})
         self.split = isinstance(p, dict) and bool(p.get("s"))  # position stored as separate X and Y
         self.props = {
-            "anchor": Prop(ks.get("a"), [0, 0, 0], fr, seed),
-            "position": None if self.split else Prop(p, [0, 0, 0], fr, seed),
-            "px": Prop(p.get("x"), 0, fr, seed) if self.split else None,
-            "py": Prop(p.get("y"), 0, fr, seed + 1) if self.split else None,
-            "pz": Prop(p.get("z"), 0, fr, seed + 4) if self.split and "z" in p else None,
-            "scale": Prop(ks.get("s"), [100, 100, 100], fr, seed + 2),
-            "rotation": Prop(ks.get("r") or ks.get("rz"), 0, fr, seed + 3),
-            "opacity": Prop(ks.get("o"), 100, fr),
+            "anchor": Prop(ks.get("a"), [0, 0, 0], fr, seed, comp),
+            "position": None if self.split else Prop(p, [0, 0, 0], fr, seed, comp),
+            "px": Prop(p.get("x"), 0, fr, seed, comp) if self.split else None,
+            "py": Prop(p.get("y"), 0, fr, seed + 1, comp) if self.split else None,
+            "pz": Prop(p.get("z"), 0, fr, seed + 4, comp) if self.split and "z" in p else None,
+            "scale": Prop(ks.get("s"), [100, 100, 100], fr, seed + 2, comp),
+            "rotation": Prop(ks.get("r") or ks.get("rz"), 0, fr, seed + 3, comp),
+            "opacity": Prop(ks.get("o"), 100, fr, 0, comp),
             "zoom": Prop(raw.get("pe"), 0, fr) if self.kind == "camera" else None,
         }
         self.tm = Prop(raw["tm"], 0, fr) if "tm" in raw else None
@@ -164,7 +179,7 @@ class LottieLayer:
         return str(doc.get("t", "")), float(doc.get("s", 72)), list(doc.get("fc") or [1, 1, 1])
 
     def understood(self) -> bool:
-        return all(timeline.understood(p.expr) for p in self.props.values() if p is not None)
+        return all(not p.expr or (expr.supported(p.expr) and not p.failed) for p in self.props.values() if p is not None)
 
 
 def layers_from(raw_layers: list, fr: float, w: float, h: float, assets: dict, depth: int = 0) -> list[LottieLayer]:

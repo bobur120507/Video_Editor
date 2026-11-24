@@ -2,9 +2,10 @@
 
 py-aep reads the binary RIFX project file directly: no After Effects needed. It mirrors AE's scripting
 object model (comps, layers, transform properties, keyframes) and evaluates keyframes with AE's own
-temporal ease (speed and influence). It does not run expressions; wiggle(...) and loopOut(...) are
-evaluated here (curves.py), others are reported in the notes. Shots, flashes, speed and text are
-decided by timeline.py, the same as for Lottie files.
+temporal ease (speed and influence). It does not run expressions: transform expressions are run by
+expr.py (layout rigs, expression controls, wiggle, loopOut...); any it can't run keep their keyframed
+value and are listed in the notes. Shots, flashes, speed and text are decided by timeline.py, the same
+as for Lottie files.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from ..blueprint import Blueprint, TextOverlay
-from . import timeline
+from . import expr, timeline
 
 TRANSFORM = {"anchor": "ADBE Anchor Point", "position": "ADBE Position", "scale": "ADBE Scale",
              "rotation": "ADBE Rotate Z", "opacity": "ADBE Opacity"}
@@ -29,22 +30,102 @@ def _py_aep():
     return py_aep
 
 
+def _plain(v):
+    """A property value as the interpreter sees it: a number, or a list for vectors and colours."""
+    a = np.asarray(v, dtype=np.float64)
+    return a.tolist() if a.ndim else float(a)
+
+
+class _ExprComp:
+    """`thisComp` / `comp("name")` for expressions: size, timing, layers by name or 1-based index."""
+
+    def __init__(self, comp, t: float, project: dict):
+        self._comp, self._t, self._project = comp, t, project
+        self.width, self.height = float(comp.width), float(comp.height)
+        self.duration, self.frameDuration = float(comp.duration), 1.0 / float(comp.frame_rate)
+        self.numLayers = float(len(comp.layers))
+
+    def layer(self, key):
+        layers = self._comp.layers
+        found = layers[int(key) - 1] if isinstance(key, float) and 1 <= key <= len(layers) else \
+            next((la for la in layers if la.name == key), None)
+        if found is None:
+            raise expr.Unsupported(f"layer {key!r}")
+        return _ExprLayer(found, self._t)
+
+
+class _ExprLayer:
+    def __init__(self, layer, t: float):
+        self._layer, self._t = layer, t
+        self.name = layer.name
+
+    def effect(self, key):
+        fx = self._layer.effects
+        items = list(fx.properties) if fx is not None else []
+        found = items[int(key) - 1] if isinstance(key, float) and 1 <= key <= len(items) else \
+            next((e for e in items if e.name == key or e.match_name == key), None)
+        if found is None:
+            raise expr.Unsupported(f"effect {key!r}")
+        return _ExprEffect(found, self._t)
+
+
+class _ExprEffect:
+    """effect("name")(n) or (match name): a parameter's value at the expression's time."""
+
+    def __init__(self, effect, t: float):
+        self._effect, self._t = effect, t
+
+    def __call__(self, key):
+        params = [q for q in self._effect.properties if not getattr(q, "num_properties", 0)]
+        found = params[int(key) - 1] if isinstance(key, float) and 1 <= key <= len(params) else \
+            next((q for q in params if q.match_name == key or q.name == key), None)
+        if found is None:
+            raise expr.Unsupported(f"effect parameter {key!r}")
+        return _plain(found.value_at_time(self._t))
+
+
 class AepProp:
-    def __init__(self, prop, fr: float, seed: int):
-        self.prop, self.fr, self.seed = prop, fr, seed
+    def __init__(self, prop, fr: float, seed: int, comp=None, project: dict | None = None):
+        self.prop, self.fr, self.seed, self.comp, self.project = prop, fr, seed, comp, project or {}
         self.expr = (getattr(prop, "expression", "") or "") if getattr(prop, "expression_enabled", True) else ""
         self.key_frames = [k.time * fr for k in prop.keyframes] if prop.keyframes else []
+        self.failed = False  # an expression we could not evaluate: the keyframed value was used
 
     def raw(self, frame: float) -> np.ndarray:
         return np.atleast_1d(np.asarray(self.prop.value_at_time(frame / self.fr), dtype=np.float64))
 
     def at(self, frame: float) -> np.ndarray:
-        return timeline.expression(self.expr, self.raw(frame), frame, self.fr, self.key_frames, self.raw, self.seed)
+        raw = self.raw(frame)
+        if not self.expr:
+            return raw
+        if self.comp is not None:
+            t = frame / self.fr
+
+            def comp_named(name):
+                if name not in self.project:
+                    raise expr.Unsupported(f"comp {name!r}")
+                return _ExprComp(self.project[name], t, self.project)
+
+            def loop(kind, n):
+                return _plain(timeline.expression(f"loopOut('{kind}', {n})", raw, frame, self.fr, self.key_frames, self.raw))
+
+            try:
+                v = expr.evaluate(self.expr, expr.Context(_plain(raw), t, _ExprComp(self.comp, t, self.project), comp_named, loop, self.seed))
+                v = np.atleast_1d(np.asarray(v, dtype=np.float64))
+                return np.concatenate([v, raw[v.size:]]) if v.size < raw.size else v[: max(raw.size, 1)]
+            except (expr.Unsupported, ValueError, TypeError):
+                self.failed = True
+        return timeline.expression(self.expr, raw, frame, self.fr, self.key_frames, self.raw, self.seed)
+
+    @property
+    def understood(self) -> bool:
+        return not self.expr or (expr.supported(self.expr) and not self.failed)
 
 
 class AepLayer:
-    def __init__(self, layer, fr: float, depth: int = 0, seen: frozenset = frozenset()):
+    def __init__(self, layer, fr: float, depth: int = 0, seen: frozenset = frozenset(), project: dict | None = None):
         self.layer, self.fr = layer, fr
+        project = project or {}
         self.name = layer.name
         self.kind = _kind(layer)
         self.hidden = not layer.enabled or bool(getattr(layer, "guide_layer", False))
@@ -55,7 +136,7 @@ class AepLayer:
         self.w = float(getattr(layer, "width", 0) or comp.width)
         self.h = float(getattr(layer, "height", 0) or comp.height)
         seed = (layer.index + 1) * 101
-        self.props = {k: AepProp(layer.transform.property(m), fr, seed + i) for i, (k, m) in enumerate(TRANSFORM.items())}
+        self.props = {k: AepProp(layer.transform.property(m), fr, seed + i, comp, project) for i, (k, m) in enumerate(TRANSFORM.items())}
         self.zoom = AepProp(layer.property("ADBE Camera Options Group").property("ADBE Camera Zoom"), fr, 0) if self.kind == "camera" else None
         self.remap = AepProp(layer.property("ADBE Time Remapping"), fr, 0) if getattr(layer, "time_remap_enabled", False) else None
         self.parent = None  # set by layers_of
@@ -67,7 +148,7 @@ class AepLayer:
             inner = layer.source
             if id(inner) not in seen and depth < timeline.MAX_NESTING:  # AE forbids cycles; guard anyway
                 self.inner_fps = float(inner.frame_rate)
-                self.children = layers_of(inner, depth + 1, seen | {id(inner)})
+                self.children = layers_of(inner, depth + 1, seen | {id(inner)}, project)
 
     def visible(self, frame: float) -> bool:
         return not self.hidden and self.ip - timeline.EPS <= frame < self.op - timeline.EPS and (
@@ -109,7 +190,7 @@ class AepLayer:
         return str(getattr(doc, "text", "") or ""), float(getattr(doc, "font_size", 72) or 72), list(getattr(doc, "fill_color", None) or [1, 1, 1])
 
     def understood(self) -> bool:
-        return all(timeline.understood(p.expr) for p in self.props.values())
+        return all(p.understood for p in self.props.values())
 
 
 def _kind(layer) -> str:
@@ -144,9 +225,9 @@ def comps(path: str | Path) -> list:
     return sorted(all_comps, key=lambda c: (id(c) in used, -sum(1 for la in c.layers if _kind(la) in ("footage", "precomp")), -c.duration))
 
 
-def layers_of(comp, depth: int = 0, seen: frozenset = frozenset()) -> list[AepLayer]:
+def layers_of(comp, depth: int = 0, seen: frozenset = frozenset(), project: dict | None = None) -> list[AepLayer]:
     fr = float(comp.frame_rate)
-    layers = [AepLayer(la, fr, depth, seen | {id(comp)}) for la in comp.layers]  # top of the stack first
+    layers = [AepLayer(la, fr, depth, seen | {id(comp)}, project) for la in comp.layers]  # top of the stack first
     by_layer = {id(a.layer): a for a in layers}
     for a in layers:
         parent = a.layer.parent
@@ -163,7 +244,7 @@ def to_blueprint(path: str | Path, name: str = "", comp_name: str | None = None)
     if comp is None:
         raise ValueError(f"No composition named “{comp_name}”; the project has: {', '.join(c.name for c in candidates)}")
     fr = float(comp.frame_rate)
-    layers = layers_of(comp)
+    layers = layers_of(comp, project={c.name: c for c in candidates})
     bp = timeline.assemble(layers, fr, int(comp.width), int(comp.height), 0.0,
                            comp.duration * fr, name=name, origin=f"{path.name} › {comp.name}",
                            sha256=hashlib.sha256(path.read_bytes()).hexdigest(), tag="aep", source_label=f".aep, comp “{comp.name}”")

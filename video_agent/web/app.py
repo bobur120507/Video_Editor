@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -46,6 +47,10 @@ class Job:
     kind: str  # clone, render, graph
     status: str = "running"  # running, done, failed
     step: str = ""
+    progress: float | None = None  # 0..1 through the current step while it can tell; None: it can't
+    stage: str = ""  # "Step 1 of 2: planning" when the job has several measured steps
+    started: float = field(default_factory=time.time)  # unix seconds, for elapsed time
+    stage_started: float = field(default_factory=time.time)  # when the current step began: the estimate uses its pace
     result: dict = field(default_factory=dict)
     error: str = ""
 
@@ -146,10 +151,21 @@ async def _clone_job(app: web.Application, job: Job, path: Path | None, url: str
 
 async def _render_job(app: web.Application, job: Job, bp: Blueprint, clips: list[str], job_dir: Path, *,
                       template_id: int | None, texts: list[str] | None, adjustments: dict | None,
-                      use_preferences: bool, version: int) -> None:
-    job.step = "Rendering… (shot planning, colour matching, effects, encode)"
+                      use_preferences: bool, version: int, upscale: bool = True) -> None:
+    fast = "" if upscale else " (fast: no AI upscaling)"
+    job.step, job.progress = "Starting…", 0.0
     out = job_dir / f"edit_v{version}.mp4"
-    outcome = await apply(_user(), bp, clips, out, texts=texts, adjustments=adjustments, use_preferences=use_preferences)
+
+    stages = {1: "Step 1 of 2: planning the shots", 2: "Step 2 of 2: rendering" + fast}
+
+    def progress(step: int, share: float, what: str) -> None:  # called from the planning and render threads
+        if job.stage != stages[step]:
+            job.stage, job.stage_started = stages[step], time.time()
+        job.progress, job.step = round(share, 4), what
+
+    outcome = await apply(_user(), bp, clips, out, texts=texts, adjustments=adjustments, use_preferences=use_preferences,
+                          upscale=upscale, progress=progress)
+    job.progress, job.stage = None, ""
     rendered = await storage.save_blueprint(_user(), outcome.blueprint)
     r = outcome.result
     await storage.add_fingerprint(user_id=_user(), blueprint_id=rendered.id, file_sha256=sha256_file(r.master), master_path=str(r.master))
@@ -170,7 +186,7 @@ async def _render_job(app: web.Application, job: Job, bp: Blueprint, clips: list
         "score": None,
     }
     app[RENDERS][job.id] = {"clips": clips, "dir": job_dir, "master": str(r.master), "template_id": template_id,
-                              "blueprint_id": rendered.id, "version": version, "scores": {}}
+                              "blueprint_id": rendered.id, "version": version, "scores": {}, "upscale": upscale}
     reference = outcome.blueprint.source.path
     if reference and Path(reference).exists():
         job.step = "Measuring the match with the reference… (about as long as the video)"
@@ -328,7 +344,8 @@ async def delete_template(request: web.Request) -> web.Response:
 
 
 async def post_apply(request: web.Request) -> web.Response:
-    """multipart: template_id, clip files (several), text (one caption per line), tweak (plain-word changes)."""
+    """multipart: template_id, clip files (several), text (one caption per line), tweak (plain-word changes),
+    fast (skip Real-ESRGAN upscaling, like the CLI's --no-upscale)."""
     if not request.content_type.startswith("multipart/"):
         raise web.HTTPBadRequest(text="Send at least one clip.")
     job_dir, clips, fields = _job_dir(), [], {}
@@ -350,8 +367,9 @@ async def post_apply(request: web.Request) -> web.Response:
     bp = (await storage.get_blueprint(tpl.blueprint_id)).blueprint
     adjustments = await parse_feedback(fields["tweak"]) if fields.get("tweak", "").strip() else None
     texts = fields.get("text", "").splitlines()
+    upscale = not fields.get("fast")
     job = _start(request.app, "render", lambda j: _render_job(request.app, j, bp, clips, job_dir, template_id=tpl.id, texts=texts,
-                                                              adjustments=adjustments, use_preferences=True, version=1))
+                                                              adjustments=adjustments, use_preferences=True, version=1, upscale=upscale))
     return web.json_response({"job": job.id})
 
 
@@ -373,7 +391,8 @@ async def post_change(request: web.Request) -> web.Response:
     await storage.add_weights(_user(), adj)
     job = _start(request.app, "render", lambda j: _render_job(request.app, j, bp, render["clips"], render["dir"],
                                                               template_id=render["template_id"], texts=None, adjustments=adj,
-                                                              use_preferences=False, version=render["version"] + 1))
+                                                              use_preferences=False, version=render["version"] + 1,
+                                                              upscale=render["upscale"]))
     return web.json_response({"job": job.id, "applying": adj})
 
 

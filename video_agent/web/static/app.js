@@ -40,6 +40,35 @@ function status(text, kind = "") {
   return h("p", { class: `status ${kind}`, role: kind === "error" ? "alert" : "status" }, text);
 }
 
+function clock(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  return s >= 60 ? `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s` : `${s} s`;
+}
+
+// What a running job is doing: its step, a bar when the step can tell how far it is, elapsed time and an
+// estimate of what's left (elapsed / share done, once enough is done for the estimate to mean something).
+// The estimate uses the current step's own pace (planning time depends on your clips' length, render time
+// on the template), so it only appears once a step is far enough along to judge.
+function progressBox(job) {
+  const now = Date.now() / 1000, elapsed = now - job.started;
+  const box = h("div", { class: "progress-box", role: "status" });
+  if (job.stage) box.append(h("p", { class: "stage" }, job.stage));
+  box.append(h("p", { class: "status" }, job.step || "…"));
+  if (job.progress != null) {
+    const pct = Math.round(job.progress * 100);
+    box.append(h("div", { class: "progress", role: "progressbar", "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": pct,
+      "aria-label": job.stage || job.step || "Progress" }, h("span", { style: `--v:${pct}%` })));
+    const inStep = now - (job.stage_started || job.started);
+    const left = job.progress > 0.1 && inStep > 3 ? inStep * (1 - job.progress) / job.progress : null;
+    const leftText = left == null ? "" : left < 3 ? " · this step: almost done" : ` · this step: about ${clock(left)} left`;
+    box.append(h("p", { class: "hint" }, `${pct}% of this step · ${clock(elapsed)} elapsed${leftText}`));
+  } else {
+    box.append(h("div", { class: "progress busy", "aria-hidden": "true" }, h("span")),
+      h("p", { class: "hint" }, `${clock(elapsed)} elapsed`));
+  }
+  return box;
+}
+
 async function poll(jobId, onStep) {
   for (;;) {
     const job = await api(`/api/jobs/${jobId}`);
@@ -92,7 +121,7 @@ async function graphSection(bp, video, onBackfill) {
       btn.disabled = true;
       try {
         const { job } = await api(`/api/blueprints/${bp.id}/graph`, { method: "POST" });
-        if (job) await poll(job, (j) => (note.textContent = j.step || "…"));
+        if (job) await poll(job, (j) => note.replaceChildren(progressBox(j)));
         onBackfill();
       } catch (e) {
         note.replaceWith(status(e.message, "error"));
@@ -139,7 +168,7 @@ function cloneView() {
     out.replaceChildren(status("⏳ Uploading…"));
     try {
       const { job } = await api("/api/clone", { method: "POST", body: data });
-      const done = await poll(job, (j) => out.replaceChildren(status(j.step || "…")));
+      const done = await poll(job, (j) => out.replaceChildren(progressBox(j)));
       if (done.status === "failed") throw new Error(`Could not analyze that video: ${done.error}`);
       location.hash = `#/bp/${done.result.blueprint_id}?review=1`;
     } catch (err) {
@@ -254,6 +283,8 @@ async function applyView(params) {
     h("label", { for: "clips" }, "Your raw clips (several is best)"), clips,
     h("label", { for: "text" }, "On-screen text, one caption per line (the first is the hook). Optional."), text,
     h("label", { for: "tweak" }, "Changes. Optional."), tweak,
+    h("label", { class: "toggle", for: "fast" }, h("input", { type: "checkbox", name: "fast", id: "fast", value: "1" }),
+      "Fast render: skip AI upscaling (minutes instead of ~20 for low-resolution clips)"),
     h("div", { class: "row" }, submit), out);
   form.onsubmit = async (e) => {
     e.preventDefault();
@@ -285,7 +316,7 @@ async function renderView(jobId) {
   page("Rendering", out);
   let job = await api(`/api/jobs/${jobId}`);
   while (job.status === "running" && !job.result.video) {
-    out.replaceChildren(status(job.step || "…"));
+    out.replaceChildren(progressBox(job));
     await new Promise((r) => setTimeout(r, 1000));
     job = await api(`/api/jobs/${jobId}`);
   }
@@ -294,7 +325,7 @@ async function renderView(jobId) {
   const bp = await api(`/api/blueprints/${r.blueprint_id}`);
   const { box, video } = player(r.video, bp.markers.moves);
 
-  const scoreBox = h("div", {}, status(job.step || "Measuring the match…"));
+  const scoreBox = h("div", {}, progressBox(job));
   const side = h("section", { class: "card stack side" },
     h("h2", {}, `✅ v${r.version} · ${r.duration.toFixed(1)}s`),
     h("div", { class: "row" }, h("a", { class: "btn", href: r.video, download: true }, "Download master")),
@@ -331,7 +362,7 @@ async function renderView(jobId) {
   const layout = h("div", { class: "layout" }, h("div", { class: "card video-card" }, box), side);
   page(`Your edit`, layout, await graphSection(bp, video, route));
 
-  const final = job.status === "running" ? await poll(jobId) : job;
+  const final = job.status === "running" ? await poll(jobId, (j) => j.status === "running" && scoreBox.replaceChildren(progressBox(j))) : job;
   scoreBox.replaceChildren(scoreCard(final.result.score) || status("No match score (the reference video is not on disk)."));
 }
 

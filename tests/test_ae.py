@@ -3,13 +3,15 @@ import json
 import math
 import subprocess
 import zipfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 
 from video_agent import knowledge
-from video_agent.ae import curves, effects, lottie, mogrt
+from video_agent.ae import curves, effects, expr, lottie, mogrt
 from video_agent.director import plan_edit
 from video_agent.render import render
 from video_agent.render.engine import RenderOptions
@@ -111,7 +113,14 @@ def test_rendered_edit_moves_like_the_ae_comp(tmp_path):
     clip = tmp_path / "static.mp4"
     subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-loop", "1", "-i", tmp_path / "tex.png", "-t", "8", "-r", "30",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "12", clip], check=True)
-    out = render(bp, plan_edit(bp, [clip]), tmp_path / "out.mp4", RenderOptions(upscale=False)).master
+    seen = []
+    planning = []
+    plan = plan_edit(bp, [clip], lambda f, w: planning.append((f, w)))
+    assert [f for f, _ in planning] == sorted(f for f, _ in planning) and planning[-1] == (1 - 0.23, "Choosing the best moments for each shot")
+    out = render(bp, plan, tmp_path / "out.mp4", RenderOptions(upscale=False, progress=lambda f, w: seen.append((f, w)))).master
+    shares = [f for f, _ in seen]
+    assert shares == sorted(shares) and shares[0] == 0 and shares[-1] == 1.0  # it only moves forward, start to end
+    assert [w for _, w in seen if w.startswith("Shot")] == ["Shot 1 of 3", "Shot 2 of 3", "Shot 3 of 3"]
     cap, frames = cv2.VideoCapture(str(out)), []
     while (ok := cap.read())[0]:
         frames.append(cv2.cvtColor(ok[1], cv2.COLOR_BGR2GRAY))
@@ -197,13 +206,144 @@ def test_aep_project_imports_like_its_bodymovin_export(tmp_path):
     assert np.allclose(a.segments[1].camera.r, b.segments[1].camera.r, atol=1e-6)
 
 
+def make_motion_aep(path) -> dict:
+    """A motion-graphics project built like real templates: nested comps, a 3D camera dolly, a layout-rig
+    expression, an expression-control checkbox, a track matte, a lorem-ipsum block, and words that a later
+    part's background covers. Returns the numbers the tests check against."""
+    py_aep = pytest.importorskip("py_aep")
+    from py_aep.enums import TrackMatteType
+
+    app = py_aep.new()
+    root = app.project.root_folder
+    main = root.add_comp("Title", 1920, 1080, 1.0, 2.0, 30.0)
+    part1 = root.add_comp("Part 1", 1920, 1080, 1.0, 1.0, 30.0)
+    part2 = root.add_comp("Part 2", 1920, 1080, 1.0, 1.4, 30.0)
+
+    grey = part1.add_solid([0.5, 0.5, 0.5], "Grey BG")
+    blue = part1.add_solid([0.1, 0.2, 0.9], "Blue BG")  # on top of grey until 0.3 s, but switched off by the checkbox
+    blue.out_point = 0.3
+    blue.transform.property("ADBE Opacity").expression = 'comp("Title").layer("Controls").effect("BG on")(1)*100'
+    rig = part1.add_null()
+    rig.name = "Group"
+    words = part1.add_text("fast cars")
+    words.three_d_layer = True
+    words.parent = rig  # parented first: setting a parent compensates the child for the parent's stored scale
+    sc = rig.transform.property("ADBE Scale")
+    sc.value = [50, 50, 100]
+    sc.expression = "// layout rig\nk = thisComp.width/960;\n[value[0]*k, value[1]*k]"  # 50 % stored, 100 % on screen
+    part1.add_text("Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore")
+    cam = part1.add_camera("Cam")
+    pos = cam.transform.property("ADBE Position")
+    pos.set_value_at_time(0.0, [960, 540, -500])
+    pos.set_value_at_time(1.0, [960, 540, -2000])
+
+    red = part2.add_solid([0.8, 0.1, 0.1], "Red BG")
+    matte = part2.add_solid([1, 1, 1], "Matte")
+    red.set_track_matte(matte, TrackMatteType.ALPHA)
+    part2.add_text("now")
+
+    l1 = main.add(part1)
+    l1.in_point, l1.out_point = 0.0, 1.0
+    l2 = main.add(part2)  # on top of part 1 from 0.6 s
+    l2.start_time, l2.in_point, l2.out_point = 0.6, 0.6, 2.0
+    ctrl = main.add_null()
+    ctrl.name = "Controls"
+    box = ctrl.effects.add_property("ADBE Checkbox Control")
+    box.name = "BG on"
+    box.property("ADBE Checkbox Control-0001").value = 0
+    app.project.save(str(path))
+    zoom = cam.property("ADBE Camera Options Group").property("ADBE Camera Zoom").value
+    return {"zoom": float(zoom), "font": float(words.text.property("ADBE Text Document").value.font_size)}
+
+
+def test_real_template_features_import(tmp_path):
+    """Nested comps, camera, rig expression, checkbox control, matte, lorem block and covered words."""
+    from video_agent.ae import aep
+
+    facts = make_motion_aep(tmp_path / "motion.aep")
+    bp = aep.to_blueprint(tmp_path / "motion.aep")
+    # The checkbox turns the blue background off, so its 0.3 s cut is not there; the matte is not a picture.
+    assert [(s.start, s.end) for s in bp.segments] == [(0.0, 0.6), (0.6, 2.0)]
+    cam = bp.segments[0].camera
+    # The camera dolly from z -500 to -2000 over 1 s, seen as zoom / distance on the picture.
+    for i in (0, 9, 17):
+        assert cam.s[i] == pytest.approx(facts["zoom"] / (500 + 1500 * i / 30), rel=1e-3)
+    assert bp.segments[1].camera is None
+    texts = [(t.text, t.start, t.end) for t in bp.texts]
+    assert texts == [("fast cars", 0.0, 0.6), ("now", 0.6, 2.0)]  # covered by part 2's background from 0.6 s
+    # The rig expression doubles the stored 50 % scale: the words are sized at 100 % (times the camera's zoom).
+    mid_zoom = facts["zoom"] / (500 + 1500 * 9 / 30)
+    assert bp.texts[0].size == pytest.approx(min(220, facts["font"] * mid_zoom), abs=2)
+    assert any("long text block" in n for n in bp.notes)
+    assert not any("ignored" in n for n in bp.notes)  # every expression was evaluated
+
+
+MIXKIT = Path(__file__).resolve().parents[1] / "mixkit-tagline-bold-text-546" / "546" / "Title_01 (kinetic typography).aep"
+
+
+@pytest.mark.skipif(not MIXKIT.exists(), reason="Mixkit template not on this machine (not in git)")
+def test_mixkit_template_imports():
+    """A real After Effects project (Mixkit "Tagline bold text", AE CC 2019): what it imports to."""
+    from video_agent.ae import aep
+
+    bp = aep.to_blueprint(MIXKIT)
+    assert [s.start for s in bp.segments] == [0.0, 0.334, 0.534, 0.968, 1.168, 1.401] and bp.duration == 2.302
+    assert bp.segments[0].camera.describe()["zoom"] == pytest.approx(8.29, abs=0.01)  # the camera slam
+    assert [t.text for t in bp.texts] == ["make", "your\nwork\nmatter", "Mixkit", "Mixkit"]
+    assert all(t.position == "center" and t.size >= 150 for t in bp.texts)
+    assert not any("ignored" in n for n in bp.notes)
+
+
 def test_unreadable_aep_says_why(tmp_path):
     from video_agent.ae import aep
 
     pytest.importorskip("py_aep")
+    with pytest.raises(FileNotFoundError):
+        aep.to_blueprint(tmp_path / "missing.aep")
     (tmp_path / "old.aep").write_bytes(b"RIFX\0\0\0\x10Egg!not a project")
     with pytest.raises(ValueError, match="could not read"):
         aep.to_blueprint(tmp_path / "old.aep")
+
+
+# ---------------------------------------------------------------- expressions
+
+
+def test_expression_interpreter_runs_template_rigs():
+    comp = SimpleNamespace(width=1920.0, height=1080.0, duration=2.3, frameDuration=1 / 30)
+    rig = ("// created by: VIDEOLANCER.net //\r\nuserX = 1920; userY = 1080;\r\nx = thisComp.width/userX;\r\n"
+           "y = thisComp.height/userY;\r\nif(x>=y){[value[0]*y/x,value[1]]} else {[value[0],value[1]*x/y]}")
+    assert expr.evaluate(rig, expr.Context([5.2, 9.3, 100], 0.5, comp)) == [5.2, 9.3]
+    tall = SimpleNamespace(width=1080.0, height=1920.0)
+    assert expr.evaluate(rig, expr.Context([50, 50, 100], 0, tall)) == pytest.approx([50, 50 * (1080 / 1920) / (1920 / 1080)])
+    assert expr.evaluate("x=thisComp.width;\r\ny=thisComp.height;\r\n[x,y]", expr.Context([100, 100], 0, comp)) == [1920, 1080]
+    assert expr.evaluate("time*360", expr.Context(0, 0.5)) == 180
+    assert expr.evaluate("$bm_rt = linear(time, 0, 1, [0,0], [100, 50]);", expr.Context([0, 0], 0.25)) == [25, 12.5]
+    assert expr.evaluate("a = 2; a > 1 ? value + [1, 1] : value", expr.Context([1, 2], 0)) == [2, 3]
+    assert expr.evaluate("Math.max(3, Math.abs(-5))", expr.Context(0, 0)) == 5
+
+    class Effect:
+        def __call__(self, key):
+            return {1.0: 1.0, "ADBE Checkbox Control-0001": 1.0}[key]
+
+    controls = SimpleNamespace(layer=lambda name: SimpleNamespace(effect=lambda n: Effect()))
+    assert expr.evaluate('comp("Title").layer("Color Control").effect("BG on")(1)*100',
+                         expr.Context(100, 0, comp, comp=lambda name: controls)) == 100
+
+
+def test_expression_interpreter_refuses_what_it_does_not_know():
+    for src in ("for (i = 0; i < 3; i++) {}", "x = 1 +", "__import__('os').system('true')", "thisLayer.toWorld([0,0])",
+                "value.__class__", "random(10)"):
+        with pytest.raises(expr.Unsupported):
+            expr.evaluate(src, expr.Context([0, 0], 0, SimpleNamespace(width=1.0, height=1.0)))
+
+
+def test_captions_keep_their_line_breaks(tmp_path):
+    from video_agent.blueprint import TextOverlay
+    from video_agent.render.engine import _drawtext
+
+    out = _drawtext(TextOverlay(text="your\nwork\nmatter", start=0, end=1, style="static"), 0, "font.ttf", tmp_path, 1080)
+    assert out.count("drawtext=") == 3
+    assert [(tmp_path / f"text_0_{j}.txt").read_text() for j in range(3)] == ["your", "work", "matter"]
 
 
 # ---------------------------------------------------------------- mogrt
@@ -313,8 +453,27 @@ def test_cli_imports_lottie(tmp_path, monkeypatch):
 
     async def go():
         await storage.init_db()
-        await cmd_import_ae(type("A", (), {"file": str(tmp_path / "edit.json"), "name": "ae_edit", "comp": None})())
-        return await storage.get_template(0, nickname="ae_edit")
+        try:
+            await cmd_import_ae(type("A", (), {"file": str(tmp_path / "edit.json"), "name": "ae_edit", "comp": None})())
+            return await storage.get_template(0, nickname="ae_edit")
+        finally:
+            await storage._engine.dispose()
 
     assert asyncio.run(go()) is not None
     get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("w,h", [(1920, 1080), (1080, 1920), (1080, 1080)])
+def test_cover_and_grid_for_every_shape(tmp_path, w, h):
+    """The 1:1 grid preview is the centre square of the cover, for landscape (AE templates) and portrait alike."""
+    from video_agent.blueprint import Blueprint, OutputSpec, Segment, SourceInfo
+    from video_agent.render.engine import _cover_and_grid
+
+    master = tmp_path / "edit.mp4"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", f"testsrc2=s={w}x{h}:r=30:d=1",
+                    "-pix_fmt", "yuv420p", master], check=True)
+    bp = Blueprint(source=SourceInfo(duration=1, fps=30, width=w, height=h), segments=[Segment(start=0, end=1)],
+                   output=OutputSpec(width=w, height=h))
+    cover, grid = _cover_and_grid(master, bp)
+    assert cv2.imread(str(cover)).shape[:2] == (h, w)
+    assert cv2.imread(str(grid)).shape[:2] == (min(w, h), min(w, h))

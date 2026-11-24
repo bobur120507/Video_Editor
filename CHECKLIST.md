@@ -259,7 +259,11 @@ When you have no footage: find clips/images that match each reference shot (~95%
 - [x] Graph data computed once at clone time and stored in `Blueprint.audio.graph` (~1 s per clone, ~5 KB per second of video); older templates get a one-time "analyse and store" button
 - [x] Moves shown over the playing video ("#3 PUNCH"), so review needs no annotated render
 - [x] Tests: graph content (kicks in the low band, hats 40 dB quieter still show as onsets), markers, the whole clone/review/template and apply/change/rate API with a stubbed renderer, graph backfill. Checked in the browser on the sample reference (light and dark, phone width)
-- [ ] Not tried yet: uploading a clone and a real render through the site (the sample was cloned with the CLI and opened in the site; the apply API is tested with a stubbed renderer)
+- [x] Whole flow through the site on real data (2026-11-24): uploaded the TikTok car edit → cloned in ~35 s (17 shots, 96 BPM, velocity, low-quality warning) → moves and audio graph reviewed → saved as `tiktok_velocity` → McLaren footage uploaded with a caption and "Fast render" → edit ready in ~9.5 min, match score 40 s later: **70.3%** (cuts 97, timing 99, smooth 97, camera 4, colour 23), cover, grid, filming advice, re-render box and ratings
+- [x] "Fast render" checkbox on Apply (skips Real-ESRGAN, like `--no-upscale`); a re-render keeps it
+- [x] Render progress per step: "Step 1 of 2: planning the shots" (clip by clip, measured pass weights: frames 17 %, cuts 22 %, vision 61 %, then choosing 23 %) and "Step 2 of 2: rendering" (shot by shot, time-based from the shots' own pace plus a measured final-encode cost); bar, elapsed time and an estimate for the current step; clone and scoring show elapsed time with a busy bar
+- [x] Checked against the clock on a real render (Mixkit template on the McLaren clip): planning within 3-6 points of real time; rendering 8-15 points behind (finishes sooner than shown). Not re-checked on a 10-minute velocity render
+- [ ] Jobs live in memory: restarting the server loses open job pages (the files stay in `data/jobs/web/`)
 - [ ] No login: binds to 127.0.0.1 by default; put it behind auth before exposing it
 - [x] Research in `docs/`: related open projects with licences and what to reuse (`research.md`), editing techniques, datasets and papers for the agent (`learning-sources.md`), and the After Effects reverse-engineering question
 
@@ -269,7 +273,8 @@ When you have no footage: find clips/images that match each reference shot (~95%
 - [x] AE expressions and easing as numpy: bezier (CSS spec value checked), linear/ease/easeIn/easeOut, wiggle, loopOut ×4, smooth, spatial paths
 - [x] Bodymovin/Lottie import → template (CLI `import-ae`, site Clone page). Rendered zoom/rotation within 0.04 % / 0.003° of the AE keyframes (end-to-end test)
 - [x] `.aep` import with py-aep (installed; optional extra `.[ae]`): same template as the Bodymovin export of the same edit; AE's Easy Ease matches our bezier within 0.013 % (both in tests)
-- [ ] `.aep` saved by a real, recent After Effects: none available to test (projects written by py-aep only; a pre-2018 file does not parse)
+- [x] Real `.aep` (Mixkit "Tagline bold text", AE CC 2019): nested comps flattened, 3D camera slam projected (rendered within 0.05 % per step), layout-rig and control expressions evaluated by a safe interpreter (`ae/expr.py`), mattes skipped, lorem blocks left out, covered words hidden; 6 cuts on the exact in-points, captions in order (regression test runs when the file is present; the file is not in git)
+- [~] Real-project limits: camera X/Y tilt and perspective, text animators (per-letter motion), effects (gradients, fills, cell pattern) and expressions beyond the subset are not re-created; caption size/position estimated (py-aep can't measure animated text boxes); no AE render to compare pixels against
 - [~] `.mogrt` controls reader (CLI `mogrt`): tested on hand-made files only, no real .mogrt yet
 - [~] Bloom, motion-vector blur, flow retime, parametric shake in `ae/effects.py`: tested and measured, not wired into renders (vector blur matches a true shutter; flow retime ties `minterpolate` on average but has worse worst frames; no glow reference to tune bloom against)
 - [ ] Flash renders as 1 full + fading frames; an AE comp's 2 full-white frames come out 1 full + 1 half

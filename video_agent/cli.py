@@ -39,6 +39,9 @@ async def cmd_clone(args) -> None:
 
 
 async def cmd_apply(args) -> None:
+    missing = [f for f in [*args.clips, *([args.music] if args.music else [])] if not Path(f).is_file()]
+    if missing:
+        sys.exit("No such file: " + ", ".join(missing))
     tpl = await storage.get_template(LOCAL_USER, nickname=args.template)
     if not tpl:
         sys.exit(f"No template named '{args.template}'. Run: video-agent templates")

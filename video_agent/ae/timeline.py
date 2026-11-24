@@ -224,7 +224,7 @@ def _speeds(p: Placed, f0: int, f1: int, fr: float) -> tuple[list[SpeedPoint], b
     return pts or [SpeedPoint(at=0.0, speed=1.0)], reverse
 
 
-def _texts(placed: list[Placed], frames: range, fr: float, ip: float, H: int, out_h: int,
+def _texts(placed: list[Placed], frames: range, fr: float, ip: float, H: int, out_w: int, out_h: int,
            top: dict[int, int]) -> tuple[list[TextOverlay], int]:
     """Captions: each text layer while visible and above the picture on top (a later part's opaque
     background hides the words under it); words on screen together become one caption, top to bottom.
@@ -254,7 +254,9 @@ def _texts(placed: list[Placed], frames: range, fr: float, ip: float, H: int, ou
                 continue
             cam = camera_2d(p.comps[-1], fs[-1], p.leaf.depth(fs[-1])) if p.leaf.is_3d else np.eye(3)
             m = p.view(mid, fs) @ cam @ p.leaf.world(fs[-1])
-            shown.append((f0, f1, m[1, 2], text, size * math.sqrt(abs(np.linalg.det(m[:2, :2]))), rgb))
+            # Point text hangs off its baseline: the middle of the letters is ~0.35 em above the layer's origin.
+            y = (m @ np.array([0.0, -0.35 * size, 1.0]))[1]
+            shown.append((f0, f1, y, text, size * math.sqrt(abs(np.linalg.det(m[:2, :2]))), rgb))
     # One caption per stretch of time: same words back to back merge, words shown together stack.
     groups: dict[tuple[int, int], list] = {}
     for item in shown:
@@ -270,10 +272,16 @@ def _texts(placed: list[Placed], frames: range, fr: float, ip: float, H: int, ou
             merged[-1][1] = c[1]
         else:
             merged.append(c)
+    def fit(size: float, text: str) -> int:
+        """Size on the output that stays inside the frame, even at the renderer's 140 % pop-in: bold glyphs are
+        ~0.6 em wide, lines wrap at 18 characters and are 1.2 em apart."""
+        lines = text.split("\n")
+        longest = max(min(len(line), 18) for line in lines)
+        return int(max(24, min(220, size * out_h / H, 0.9 * out_w / (0.6 * 1.4 * max(longest, 1)), 0.9 * out_h / (1.2 * 1.4 * len(lines)))))
+
     out = [TextOverlay(text=text, start=round((f0 - ip) / fr, 3), end=round((f1 - ip) / fr, 3),
                        position="top" if y / H < 0.33 else "bottom" if y / H > 0.67 else "center",
-                       size=int(min(220, max(24, round(size * out_h / H)))), color=hex_color(rgb or [1, 1, 1]),
-                       style="pop" if f1 - f0 < fr else "static")
+                       size=fit(size, text), color=hex_color(rgb or [1, 1, 1]), style="pop" if f1 - f0 < fr else "static")
            for f0, f1, text, y, size, rgb in merged]
     return out, blocks
 
@@ -328,7 +336,7 @@ def assemble(layers: list, fr: float, W: int, H: int, ip: float, op: float, *, n
     if not segments:
         raise ValueError("No pictures (footage, precomps or solids) found in the comp")
 
-    texts, blocks = _texts(placed, frames, fr, ip, H, output.height, top_at)
+    texts, blocks = _texts(placed, frames, fr, ip, H, output.width, output.height, top_at)
     if blocks:
         notes.append(f"{blocks} long text block(s) (over {MAX_CAPTION} characters) read as background texture, not captions.")
     every = _deep(layers)

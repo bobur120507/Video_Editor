@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from . import storage
 from .analysis import clone_video
@@ -89,7 +90,11 @@ async def apply(
     sync_offset_frames: int = SYNC_OFFSET,
     upscale: bool = True,
     velocity: bool = True,
+    progress: Callable[[int, float, str], None] | None = None,
 ) -> ApplyOutcome:
+    """`progress(step, 0..1, what)` hears how far the edit is, per step: 1 = planning the shots (watching
+    your clips, choosing moments), 2 = rendering. Each step reports its own share: their lengths differ by
+    clip length and template, so one bar across both would guess."""
     brand = await storage.get_brand(user_id)
     prefs = await learned_preferences(user_id) if use_preferences else {}
     adj = {**prefs, **(adjustments or {})}
@@ -104,8 +109,11 @@ async def apply(
         sync_offset_frames=sync_offset_frames,
         upscale=upscale,
         velocity=velocity,
+        progress=(lambda share, what: progress(2, share, what)) if progress else None,
     )
+    if progress and _slots().locked():
+        progress(1, 0.0, "Waiting for a free render slot")
     async with _slots():
-        plan = await asyncio.to_thread(plan_edit, bp, clips)
+        plan = await asyncio.to_thread(plan_edit, bp, clips, (lambda share, what: progress(1, share, what)) if progress else None)
         result = await asyncio.to_thread(render, bp, plan, out_path, opts)
     return ApplyOutcome(result=result, plan=plan, blueprint=bp)

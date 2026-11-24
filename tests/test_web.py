@@ -92,7 +92,12 @@ async def client(tmp_path, monkeypatch):
         row = await storage.save_blueprint(user_id, bp)
         return bp, row
 
+    applied = []
+
     async def fake_apply(user_id, bp, clips, out, **kw):
+        applied.append(kw)
+        kw["progress"](2, 0.5, "Shot 2 of 4")
+        await asyncio.sleep(0.3)  # long enough for the test to see the job mid-render
         out.write_bytes(b"edit")
         for name in ("cover.jpg", "grid.jpg"):
             (out.parent / name).write_bytes(b"jpg")
@@ -103,7 +108,10 @@ async def client(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "apply", fake_apply)
     monkeypatch.setattr(webapp, "style_match", lambda ref, out: SimpleNamespace(overall=71.5, parts={"cuts": 80.0}, text=lambda: "Match: 71.5%"))
     async with TestClient(TestServer(webapp.create_app())) as c:
+        c.applied = applied
         yield c
+    if storage._engine is not None:
+        await storage._engine.dispose()
     get_settings.cache_clear()
 
 
@@ -170,10 +178,19 @@ async def test_apply_change_and_rate(client):
     data = FormData()
     data.add_field("template_id", str(tpl.id))
     data.add_field("text", "POV: day 1")
+    data.add_field("fast", "1")
     for i in range(2):
         data.add_field("clips", b"clip", filename=f"c{i}.mp4", content_type="video/mp4")
     job = (await (await client.post("/api/apply", data=data)).json())["job"]
+    for _ in range(50):  # the page shows how far the render is
+        mid = await (await client.get(f"/api/jobs/{job}")).json()
+        if mid["progress"] == 0.5:
+            break
+        await asyncio.sleep(0.02)
+    assert (mid["stage"], mid["step"]) == ("Step 2 of 2: rendering (fast: no AI upscaling)", "Shot 2 of 4")
+    assert mid["started"] > 0 and mid["stage_started"] >= mid["started"]
     done = await _wait(client, job)
+    assert done["progress"] is None  # scoring can't tell how far it is
     r = done["result"]
     assert done["status"] == "done" and r["version"] == 1 and r["video"].endswith("edit_v1.mp4") and r["notes"] == ["w"]
     assert r["score"] is None  # the test blueprint has no reference on disk
@@ -184,6 +201,7 @@ async def test_apply_change_and_rate(client):
     again = await (await client.post(f"/api/renders/{job}/change", json={"text": "darker please"})).json()
     assert again["applying"] == {"brightness": -1}
     assert (await _wait(client, again["job"]))["result"]["version"] == 2
+    assert [kw["upscale"] for kw in client.applied] == [False, False]  # the re-render keeps "fast"
 
     assert (await client.post(f"/api/renders/{job}/rate", json={"aspect": "shake", "value": 1})).status == 200
     assert (await client.post(f"/api/renders/{job}/rate", json={"aspect": "shake", "value": 5})).status == 400

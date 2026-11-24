@@ -12,7 +12,9 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 from dataclasses import dataclass
+from typing import Callable
 from pathlib import Path
 
 import cv2
@@ -91,6 +93,12 @@ class RenderOptions:
     blur: str = "auto"
     sync_offset_frames: int = SYNC_OFFSET  # move every synced edit move this many frames
     velocity: bool = True  # velocity-style references: speed ramps, real smear, never-stopping camera
+    progress: Callable[[float, str], None] | None = None  # called with (0..1, what is happening) as the render goes
+
+
+# Final encode + previews, measured on a 1080p, 69-frame edit: encode 1.7 s, previews and cover 0.5 s.
+FINAL_SECONDS_PER_FRAME = 0.025
+PREVIEW_SECONDS = 0.5
 
 
 @dataclass
@@ -109,13 +117,35 @@ def render(blueprint: Blueprint, plan: EditPlan, out_path: str | Path, opts: Ren
     spec = blueprint.output
     fps = spec.fps or get_settings().output_fps
 
+    # Progress is time-based: shots cost 0.04-2 s per frame depending on the template (measured on a title
+    # and a velocity edit), so the shots' own pace so far sets the estimate; the final encode and previews
+    # cost about the same per frame for every template.
+    started = time.monotonic()
+    shown = [0.0]
+
+    def report(share: float, what: str) -> None:
+        if opts.progress:
+            shown[0] = max(shown[0], min(1.0, max(0.0, share)))  # never backwards
+            opts.progress(shown[0], what)
+
+    def by_time(final_left: float) -> float:
+        spent = time.monotonic() - started
+        return spent / (spent + final_left) if spent + final_left > 0 else 0.0
+
     # On the data disk, not /tmp: lossless 1080p intermediates and PNG frame sequences outgrow a RAM /tmp.
     with tempfile.TemporaryDirectory(prefix="render_", dir=get_settings().dir("tmp")) as tmp:
         tmp = Path(tmp)
         parts = []
         frame_cursor = 0
+        total_frames = max(1, round(plan.shots[-1].segment.end * fps)) if plan.shots else 1
+        final_cost = FINAL_SECONDS_PER_FRAME * total_frames + PREVIEW_SECONDS
         edit_colour = _footage_colour(plan, spec.width, spec.height) if opts.one_tint and blueprint.style == "velocity" else None
         for i, shot in enumerate(plan.shots):
+            if frame_cursor:  # the shots so far set the pace of the rest
+                spent = time.monotonic() - started
+                report(by_time(spent / frame_cursor * (total_frames - frame_cursor) + final_cost), f"Shot {i + 1} of {len(plan.shots)}")
+            else:
+                report(0.0, f"Shot {i + 1} of {len(plan.shots)}")
             end_frame = round(shot.segment.end * fps)
             n_frames = max(1, end_frame - frame_cursor)
             frame_cursor = end_frame
@@ -126,6 +156,7 @@ def render(blueprint: Blueprint, plan: EditPlan, out_path: str | Path, opts: Ren
             shutil.rmtree(work, ignore_errors=True)  # frames and intermediates of a finished shot
             parts.append(part)
 
+        report(by_time(final_cost), "Transitions between shots")
         for i in range(1, len(parts)) if opts.transitions else ():
             seg = plan.shots[i].segment
             if seg.transition_in in transitions.FRAMES:
@@ -133,6 +164,7 @@ def render(blueprint: Blueprint, plan: EditPlan, out_path: str | Path, opts: Ren
                                          seg.transition_frames, seg.transition_from, seg.transition_size, seg.transition_flash)
                 log.info("transition at %.2fs: %s%s", seg.start, seg.transition_in, "" if done else " (skipped, plain cut)")
 
+        report(by_time(final_cost), "Joining the shots" + (" and adding beat glows" if opts.glows and blueprint.glows else ""))
         concat_list = tmp / "list.txt"
         concat_list.write_text("".join(f"file '{p}'\n" for p in parts))
         joined = tmp / "joined.mp4"
@@ -144,10 +176,13 @@ def render(blueprint: Blueprint, plan: EditPlan, out_path: str | Path, opts: Ren
             log.info("beat glows at %s", ", ".join(f"{g.t:.2f}s" for g in blueprint.glows))
 
         total = frame_cursor / fps
+        report(by_time(final_cost), "Final encode: text, music, colour")
         _final_pass(joined, blueprint, opts, total, fps, out_path, tmp)
 
+    report(by_time(PREVIEW_SECONDS), "Preview, cover and grid")
     preview = _telegram_preview(out_path)
     cover, grid = _cover_and_grid(out_path, blueprint)
+    report(1.0, "Done")
     return RenderResult(master=out_path, preview=preview, cover=cover, grid=grid, duration=total)
 
 
@@ -674,7 +709,8 @@ def _video_codec_args(spec) -> list:
 
 def _drawtext(t: TextOverlay, i: int, font: str, tmp: Path, height: int) -> str:
     # One drawtext per line: FFmpeg 8.0 renders "\n" in textfile as a box glyph.
-    lines = textwrap.wrap(t.text, 18) or [t.text]
+    # Line breaks in the text are kept (stacked words from an AE import); each line still wraps at 18.
+    lines = [w for para in t.text.split("\n") for w in (textwrap.wrap(para, 18) or [para])] or [t.text]
     files = []
     for j, line in enumerate(lines):
         f = tmp / f"text_{i}_{j}.txt"
@@ -739,7 +775,8 @@ def _cover_and_grid(master: Path, bp: Blueprint) -> tuple[Path, Path]:
     grid = master.with_name(master.stem + "_grid.jpg")
     t = min(1.0, max(0.0, bp.duration / 3))
     ffmpeg(["-ss", f"{t:.2f}", "-i", master, "-frames:v", 1, "-q:v", 2, cover])
-    ffmpeg(["-i", cover, "-vf", "crop=iw:iw:0:(ih-iw)/2", "-q:v", 2, grid])
+    side = min(bp.output.width, bp.output.height)  # the centre square, for portrait and landscape edits alike
+    ffmpeg(["-i", cover, "-vf", f"crop={side}:{side}:(iw-{side})/2:(ih-{side})/2", "-q:v", 2, grid])
     return cover, grid
 
 

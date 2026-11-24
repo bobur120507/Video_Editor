@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -95,11 +96,20 @@ class EditPlan:
     missing: list[str] = field(default_factory=list)  # shot list for footage the user should film
 
 
-def audit_clip(path: str | Path) -> ClipInfo:
+# Share of a clip's audit per pass, measured on a 17 s clip: frames 1.6 s, cuts 2.1 s, vision models 6.0 s.
+AUDIT_FRAMES, AUDIT_CUTS = 0.17, 0.39  # shares done after each pass; the vision models take the rest
+CHOOSE_SHARE = 0.23  # of planning spent choosing the moments after the clips are watched (3 s of 13 s)
+
+
+def audit_clip(path: str | Path, progress: Callable[[float], None] | None = None) -> ClipInfo:
+    """What a clip shows, frame by frame. `progress(0..1)` hears how far it is."""
+    report = progress or (lambda share: None)
     info = probe(path)
     times, energy, thumbs, sharp = [], [], [], []
     prev = None
     for t, frame in iter_frames(path, sample_fps=info.fps, width=240):
+        if len(times) % 15 == 0:
+            report(AUDIT_FRAMES * min(1.0, t / max(info.duration, 1e-3)))
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         energy.append(0.0 if prev is None else float(cv2.absdiff(prev, gray).mean()))
         sharp.append(float(cv2.Laplacian(gray, cv2.CV_32F).var()))
@@ -110,6 +120,7 @@ def audit_clip(path: str | Path) -> ClipInfo:
     norm = e / (np.percentile(e, 90) + 1e-6) if e.size else e
     th = np.array(thumbs).reshape(-1, len(THUMB_ZOOMS), 256)
     # Cuts inside the footage itself (when it is an already-edited video).
+    report(AUDIT_FRAMES)
     cuts = np.zeros(len(th), bool)
     if len(th):
         cuts[0] = True
@@ -118,18 +129,32 @@ def audit_clip(path: str | Path) -> ClipInfo:
     sh = np.array(sharp)
     clip = ClipInfo(probe=info, times=np.array(times), motion=np.clip(norm, 0, 1), thumbs=th, cut_after=cuts,
                     sharp=np.clip(sh / (np.percentile(sh, 90) + 1e-6), 0, 1) if sh.size else sh)
+    report(AUDIT_CUTS)
     if vision.available():
         samples = list(iter_frames(path, sample_fps=3, width=320))
         clip.sem_times = np.array([t for t, _ in samples])
         clip.sem = vision.embed_images([f for _, f in samples])
-        boxes = [vision.detect(f) for _, f in samples]
+        report(AUDIT_CUTS + (1 - AUDIT_CUTS) * 0.4)
+        boxes = []
+        for k, (_, f) in enumerate(samples):
+            boxes.append(vision.detect(f))
+            if k % 5 == 0:
+                report(AUDIT_CUTS + (1 - AUDIT_CUTS) * (0.4 + 0.6 * k / max(len(samples), 1)))
         clip.subj_h = np.array([b[0].h if b else 0.0 for b in boxes])
         clip.subj_c = np.array([(b[0].cx, b[0].cy) if b else (0.5, 0.5) for b in boxes]).reshape(-1, 2)
     return clip
 
 
-def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
-    clips = [audit_clip(p) for p in clip_paths]
+def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path], progress: Callable[[float, str], None] | None = None) -> EditPlan:
+    """`progress(0..1, what)` hears how far planning is: each clip watched in turn (by length), then choosing."""
+    report = progress or (lambda share, what: None)
+    lengths = [max(probe(p).duration, 0.1) for p in clip_paths]
+    total, done, clips = sum(lengths) or 1.0, 0.0, []
+    for i, (p, length) in enumerate(zip(clip_paths, lengths)):
+        what = f"Watching clip {i + 1} of {len(clip_paths)}" if len(clip_paths) > 1 else "Watching your clip"
+        clips.append(audit_clip(p, lambda share, d=done, n=length, w=what: report((1 - CHOOSE_SHARE) * (d + share * n) / total, w)))
+        done += length
+    report(1 - CHOOSE_SHARE, "Choosing the best moments for each shot")
     clips = [c for c in clips if c.duration >= 0.3]
     if not clips:
         raise ValueError("No usable video clips were provided.")
