@@ -20,7 +20,13 @@ HIT_GAP = 0.1  # seconds: a glow starts this close to a music hit
 MIN_FRAMES, MAX_FRAMES = 3, 15
 
 
-def find_glows(path: str | Path, fps: float, cuts: list[float], hits: list[float]) -> list[Glow]:
+SAME_SHOT = 0.13  # CLIP change (analysis/transitions.clip_change) below which the footage is still the same shot.
+# The thumbnail test alone was fooled by motion blur: the TikTok's two "glows" (4.00 s, 6.77 s) were whips into new,
+# warmer shots (CLIP change 0.18 and 0.149; the BMW edit's real light flares 0.12).
+
+
+def find_glows(path: str | Path, fps: float, cuts: list[float], hits: list[float], change: np.ndarray | None = None
+               ) -> list[Glow]:
     frames = [f for _, f in iter_frames(path, sample_fps=fps, width=180)]
     if len(frames) < 8:
         return []
@@ -33,7 +39,8 @@ def find_glows(path: str | Path, fps: float, cuts: list[float], hits: list[float
         step = np.median(warm[i:i + 3]) - np.median(warm[i - 3:i])
         near_cut = any(abs(i - c) <= CUT_GAP for c in cut_frames)
         near_hit = any(abs(i / fps - h) <= HIT_GAP for h in hits)
-        if step > STEP and not near_cut and near_hit and float(thumb(frames[i - 2]) @ thumb(frames[i + 2])) > SAME:
+        same_shot = change is None or float(change[max(0, i - 3):i + 4].max()) < SAME_SHOT
+        if step > STEP and not near_cut and near_hit and same_shot and float(thumb(frames[i - 2]) @ thumb(frames[i + 2])) > SAME:
             i += int(np.argmax(np.diff(warm[i - 1:i + 3])))  # the frame where the colour actually jumps
             before, level = np.median(warm[i - 3:i]), np.median(warm[i:i + 3])
             j = i + 1

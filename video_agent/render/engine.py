@@ -130,7 +130,7 @@ def render(blueprint: Blueprint, plan: EditPlan, out_path: str | Path, opts: Ren
             seg = plan.shots[i].segment
             if seg.transition_in in transitions.FRAMES:
                 done = transitions.apply(seg.transition_in, parts[i - 1], parts[i], spec.width, spec.height, fps, LOSSLESS,
-                                         seg.transition_frames, seg.transition_from)
+                                         seg.transition_frames, seg.transition_from, seg.transition_size, seg.transition_flash)
                 log.info("transition at %.2fs: %s%s", seg.start, seg.transition_in, "" if done else " (skipped, plain cut)")
 
         concat_list = tmp / "list.txt"

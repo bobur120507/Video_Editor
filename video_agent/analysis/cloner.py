@@ -10,14 +10,14 @@ import cv2
 import numpy as np
 
 from .. import vision
-from ..blueprint import AudioInfo, Blueprint, ColorProfile, HookInfo, OutputSpec, Segment, SourceInfo, SpeedPoint, Subject
+from ..blueprint import AudioInfo, Blueprint, ColorProfile, HookInfo, OutputSpec, Segment, SourceInfo, SpeedPoint, Subject, SHAPED, clear_whips
 from ..config import get_settings
 from ..media import color_stats, constant_fps_copy, extract_audio, ffmpeg, iter_frames, probe, sha256_file, thumb
-from .audio import analyze_audio
+from .audio import analyze_audio, audio_graph
 from .camera import estimate_curves_and_blur
 from .events import detect_hits, extract_events, link_whips, sync_target
 from .glow import find_glows
-from .transitions import find_portals
+from .transitions import classify, clip_change, find_portals, gradual_cuts
 from .velocity import edit_style, segment_velocity, sharpness
 from .visual import detect_cuts, find_flashes, flash_aware_cuts, flash_length, segment_features, track_frames
 
@@ -48,7 +48,8 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
             wav = extract_audio(path, Path(tmp) / "a.wav")
             res = analyze_audio(wav)
             hits, kinds = detect_hits(wav) if res.has_music else ([], [])
-        audio = AudioInfo(bpm=res.bpm, beats=res.beats, drops=res.drops, hits=hits, hit_kinds=kinds, has_music=res.has_music)
+            graph = audio_graph(wav)
+        audio = AudioInfo(bpm=res.bpm, beats=res.beats, drops=res.drops, hits=hits, hit_kinds=kinds, has_music=res.has_music, graph=graph)
         if res.has_music:
             track = settings.dir("tracks") / f"{digest[:16]}.m4a"
             if not track.exists():
@@ -61,6 +62,11 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
     track = track_frames(path, info.fps)
     flashes = find_flashes(track)
     cuts = flash_aware_cuts(path, detect_cuts(path, info.fps), flashes, info.fps)
+    change = clip_change(path, info.fps) if vision.available() else None
+    hidden = gradual_cuts(path, info.fps, cuts, change) if change is not None else []
+    if hidden:
+        notes.append(f"{len(hidden)} gradual transition(s) (whips, slides, masked reveals) found by what the picture shows.")
+        cuts = sorted(cuts + hidden)
 
     bounds = _shot_bounds(cuts, info.duration)
     audio.sync_to = sync_target([a for a, _ in bounds[1:]], audio.hits, audio.hit_kinds, info.fps)
@@ -76,6 +82,7 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
         notes.append(f"Footage repeats frames throughout ({held:.0%}, e.g. animation on twos); slow-mo judged against that.")
 
     portals = find_portals(path, [a for a, _ in bounds[1:]], info.fps)
+    kinds = classify(path, [a for a, _ in bounds[1:]], info.fps) if vision.available() else {}
     segments: list[Segment] = []
     for (start, end), curve, feat, soft in zip(bounds, curves, feats, softness):
         slowmo = feat["moving"] and feat["dup_ratio"] > max(0.3, held + 0.25)
@@ -84,7 +91,8 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
         if any(start + 0.15 < f < end - 0.05 for f in flashes):
             effects.append("flash")
         at_start = [f for f in flashes if abs(f - start) <= 0.15]
-        transition = "flash" if at_start else "portal" if start in portals else "cut"
+        kind = kinds.get(start, {})
+        transition = "flash" if at_start else "portal" if start in portals else kind.get("kind", "cut")
         speed = [SpeedPoint(at=0.0, speed=0.5)] if slowmo else [SpeedPoint(at=0.0, speed=1.0)]
         segments.append(
             Segment(
@@ -96,6 +104,8 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
                 motion=round(feat["motion"], 3),
                 camera=curve if len(curve) > 1 else None,
                 flash_frames=flash_length(track, at_start[0], info.fps) if at_start else 0,
+                transition_size=kind.get("size", 0.0),
+                transition_flash=kind.get("flash", start in portals),
                 blur=soft,
                 velocity=segment_velocity(track.flow, start, end, info.fps),
             )
@@ -114,12 +124,15 @@ def clone_video(path: str | Path, name: str = "", origin: str = "") -> Blueprint
             seg.thumbs = [[round(float(v), 3) for v in thumb(shot[i][1])] for i in pick]
             seg.thumbs_t = [round(shot[i][0] - seg.start, 4) for i in pick]
 
-    glows = find_glows(path, info.fps, [a for a, _ in bounds[1:]], audio.hits)
+    glows = find_glows(path, info.fps, [a for a, _ in bounds[1:]], audio.hits, change)
     if glows:
         notes.append(f"Beat glows: the picture turns warm and golden on {len(glows)} beat(s).")
     for seg in segments:
         seg.events = extract_events(seg, audio.hits)
     link_whips(segments)
+    for i, seg in enumerate(segments):
+        if seg.transition_in in SHAPED:
+            clear_whips(segments, i)
     if vision.available():
         _describe_shots(segments, frames)
     else:

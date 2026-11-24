@@ -3,7 +3,8 @@
 Clone the editing style of any short vertical video (cuts, beat sync, speed changes, zooms, flashes,
 colour grade) into a reusable **Edit Blueprint**, then apply it to your own raw clips. You can drive
 it from Telegram or the command line. Full roadmap: [Fully Automated Instagram.md](Fully%20Automated%20Instagram.md).
-What's done and what's left: [CHECKLIST.md](CHECKLIST.md).
+What's done and what's left: [CHECKLIST.md](CHECKLIST.md). Related projects, learning sources and the
+After Effects question: [docs/research.md](docs/research.md).
 
 ## Setup (Ubuntu)
 
@@ -50,6 +51,20 @@ Telegram:
 | `/publish` | Get a caption and hashtags in your voice (auto-posting waits for the Meta key) |
 | Forward a finished video back to the bot | Reuses its template on new clips |
 
+Web (same flow as the bot, plus a graph of the reference's sound):
+
+```bash
+.venv/bin/video-agent web                 # then open http://127.0.0.1:8080
+.venv/bin/video-agent web --port 9000     # another port; --host 0.0.0.0 only behind a login (there is none)
+```
+
+Clone a file or link, check the moves on the video and the graph, fix them in plain words, save the template,
+apply it to clips, and get the video, cover, grid and match score; type changes to re-render. The graph shows
+the waveform, a dB spectrogram, low/mid/high band energy, onset strength (quiet sounds too), beats, kick/snare
+hits, drops, cuts and moves on one time axis; click it to seek. Its data is computed once at clone time and
+stored in the template. The site shows the templates of `WEB_USER_ID` (default 0, the CLI's; set it to your
+Telegram user id to see the bot's).
+
 CLI:
 
 ```bash
@@ -60,6 +75,9 @@ CLI:
 #   --no-upscale                skip Real-ESRGAN (faster renders of low-resolution footage)
 #   --no-velocity               velocity templates rendered like calm edits (no speed ramps / drift)
 .venv/bin/video-agent templates
+.venv/bin/video-agent import-ae my_edit.aep --comp "Main" --name ae_v1   # After Effects project (needs: pip install -e ".[ae]")
+.venv/bin/video-agent import-ae my_ae_comp.json --name ae_v2             # or a Bodymovin/Lottie export
+.venv/bin/video-agent mogrt lower_third.mogrt                     # controls a Motion Graphics Template exposes
 .venv/bin/video-agent caption "BMW M4 night drive"
 .venv/bin/video-agent score reference.mp4 my_edit.mp4        # how closely an edit matches its reference
 .venv/bin/video-agent bench                                 # ground-truth match benchmark (~10 min)
@@ -69,7 +87,7 @@ CLI:
 ## How it works
 
 ```
-clone:  video ─► librosa (BPM, beats, drops) + PySceneDetect (cuts) + optical flow
+clone:  video ─► librosa (BPM, beats, drops, stored audio graph) + PySceneDetect (cuts) + optical flow
                (motion, zoom punches, shake, slow-mo hints) + colour stats  ─► Blueprint JSON
 
 apply:  Blueprint + clips ─► AI Director (motion-matched clip windows, face-centred 9:16 crop,
@@ -102,6 +120,9 @@ apply:  Blueprint + clips ─► AI Director (motion-matched clip windows, face-
 | `video_agent/llm.py` | Hybrid LLM: Claude, OpenRouter, Gemini, OpenAI, tried in `LLM_PROVIDERS` order with fallback |
 | `video_agent/storage.py` | `Brand_Identity`, `Edit_Blueprints`, `Template_Vault`, `Published_Media_Fingerprints`, `Learning_Weights` (PostgreSQL with JSONB; SQLite fallback) |
 | `video_agent/meta.py` | Placeholder for every Instagram Graph API feature |
+| `video_agent/ae/` | Matching After Effects from public sources: expression functions and bezier easing (`curves`), `.aep` (`aep`, via py-aep) and Bodymovin/Lottie (`lottie`) import sharing `timeline`, `.mogrt` controls (`mogrt`), bloom, motion-vector blur, optical-flow retime and parametric shake (`effects`) |
+| `video_agent/knowledge/` | `techniques.yaml`: editing techniques with parameters and the page each came from (`docs/learning-sources.md`) |
+| `video_agent/web/` | Web UI (aiohttp, no extra install): clone, move review, templates, apply, score; `static/graph.js` draws the audio graph |
 
 ### After Effects replacement (hybrid render tiers)
 
@@ -115,6 +136,7 @@ After Effects doesn't run on Linux, and NexRender needs Windows or macOS. The pl
 | Upscaling (AI) | Real-ESRGAN (`realesrgan-ncnn-vulkan` in `tools/realesrgan/`, video model, 25% original texture mixed back) | Working; ~1–2 s per frame; Lanczos is the fallback |
 | Motion graphics, kinetic text | Remotion (React templates) | Planned |
 | 3D text, camera, VFX | Blender headless (`blender -b -P`) | Planned |
+| After Effects comps | `.aep` projects (py-aep) and Bodymovin/Lottie JSON (`video-agent import-ae`): cuts, keyframes with AE's easing, parents, time remaps, flashes, text | Working; rendered camera within 0.04 % zoom / 0.003° of the AE keyframes. `.aep` from AE CC 2018 or later |
 | After Effects | NexRender on a remote Windows worker | Optional, if a subscription comes back |
 
 ### Colour pipeline

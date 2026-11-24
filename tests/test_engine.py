@@ -594,3 +594,50 @@ def test_velocity_render_ramps_smears_and_drifts(samples, tmp_path, caplog):
     assert info.duration == pytest.approx(bp.duration, abs=0.1)
     text = caplog.text
     assert "velocity: drift" in text and "velocity retime failed" not in text
+
+
+def test_new_transition_types_render_and_replace_whips():
+    import numpy as np
+
+    from video_agent import labels
+    from video_agent.blueprint import Blueprint, EditEvent, SourceInfo
+    from video_agent.render.transitions import cutout_frame, silhouette_frame, zoom_frame
+
+    a = np.full((320, 180, 3), 40, np.uint8)
+    b = np.full((320, 180, 3), 200, np.uint8)
+    assert zoom_frame(a, b, 0.25, 0.0).mean() < 60 and zoom_frame(a, b, 1.0, 0.75).mean() > 190  # the old shot, then the new
+    mask = np.zeros((320, 180), np.float32)
+    mask[150:250, 40:140] = 1
+    assert silhouette_frame(b * 0 + 30, mask, 1.0)[200, 90].mean() > 240  # the car flashes white...
+    assert np.array_equal(silhouette_frame(b, mask, 0.0), b)  # ...and fades back to the picture
+    left = cutout_frame(a, b, mask, 0.5, 0.4, "left")
+    assert left[200, :60].mean() > left[200, 120:].mean()  # coming in from the left: the car is on the left side first
+
+    segs = [Segment(start=0, end=1, events=[EditEvent(kind="whip_out", t=1.0, strength=1.0, dx=1.0)]),
+            Segment(start=1, end=2, events=[EditEvent(kind="whip_in", t=0.0, strength=1.0, dx=1.0)])]
+    bp = Blueprint(source=SourceInfo(duration=2, fps=30, width=1080, height=1920), segments=segs)
+    bp2, done = labels.apply_corrections(bp, "add 1.0 cut-out from the left")
+    assert done and bp2.segments[1].transition_in == "cutout" and bp2.segments[1].transition_from == "left"
+    assert not any(e.kind.startswith("whip") for s in bp2.segments for e in s.events)  # the cut-out replaces the whip
+
+
+def test_transitions_apply_across_real_clips(tmp_path, monkeypatch):
+    import subprocess
+
+    import numpy as np
+
+    from video_agent.render import transitions as T
+    from video_agent.render.engine import LOSSLESS
+
+    for name, colour in (("a", "red"), ("b", "blue")):
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s=180x320:r=30:d=0.5",
+                        *map(str, LOSSLESS), str(tmp_path / f"{name}.mp4")], check=True)
+    mask = np.zeros((320, 180), np.float32)
+    mask[150:250, 40:140] = 1
+    monkeypatch.setattr(T, "car_mask", lambda frame: mask)
+    monkeypatch.setattr(T, "find_wheel", lambda frame: None)  # portal falls back to a round opening
+    monkeypatch.setattr(T.vision, "available", lambda: False)
+    for kind in ("silhouette", "portal", "cutout", "zoom", "panel"):  # silhouette: nothing before the cut
+        for n in ("a", "b"):
+            (tmp_path / f"{n}_{kind}.mp4").write_bytes((tmp_path / f"{n}.mp4").read_bytes())
+        assert T.apply(kind, tmp_path / f"a_{kind}.mp4", tmp_path / f"b_{kind}.mp4", 180, 320, 30, LOSSLESS, 0, "left"), kind

@@ -1,0 +1,143 @@
+# Machine-readable index of docs/learning-sources.md: one entry per technique the agent can re-create.
+# status: verified (page read) / snippet (search result only) / derived / heuristic (tunable default) / uncertain.
+# Rule code must not treat heuristic values as hard constraints. Seed set: extend it as techniques are added.
+- id: shake.wiggle
+  topic: camera_shake
+  sources:
+    - url: "https://ae-expressions.docsforadobe.dev/objects/property/"
+      status: verified
+    - url: "https://borisfx.com/blog/shake-effect-after-effects-tutorial/"
+      status: verified
+  takeaway: >
+    Smoothed-noise offset per axis; amplitude envelope decays after the hit.
+  model: "offset(t) = env(t) * sum_k amp_mult^k * noise(2^k * freq * t + seed)"
+  parameters:
+    freq_hz:      {default: 12, range: [8, 15], kind: heuristic}
+    amp_px_1080w: {default: 25, range: [10, 40], kind: heuristic}
+    rot_deg:      {default: 2,  range: [0, 3],  kind: heuristic}
+    octaves:      {default: 1,  doc_default: 1}
+    amp_mult:     {default: 0.5, doc_default: 0.5}
+    decay_frames: {default: 20, source: borisfx S_Shake amp 6->0 over ~20f}
+  constraints: ["overscale >= 1 + 2*amp/width", "enable motion blur"]
+
+- id: ease.easy_ease
+  topic: easing
+  sources: [{url: "https://helpx.adobe.com/after-effects/using/speed.html", status: snippet}]
+  takeaway: Easy Ease = speed 0, influence 33.33% both sides.
+  parameters:
+    cubic_bezier: {value: [0.333, 0.0, 0.667, 1.0], kind: derived, checked: "matches AE's speed/influence ease as py-aep evaluates it, within 0.013% of the move (tests/test_ae.py)"}
+
+- id: speed.velocity_ramp
+  topic: speed_ramp
+  sources:
+    - {url: "https://docs.motionscript.com/articles/speed-control.html", status: verified}
+    - {url: "https://revisionfx.com/faq/how_do_i_get_the_most_out_of_twixtor/", status: verified}
+  takeaway: Source time is the integral of the speed curve; snap speed at beats with high-influence beziers.
+  model: "src(t) = src0 + integral_0^t s(tau) dtau"
+  parameters:
+    slow_speed:   {range: [0.2, 0.4], kind: heuristic}
+    fast_speed:   {range: [2.0, 4.0], kind: heuristic}
+    snap_frames:  {range: [2, 6],     kind: heuristic}
+    influence:    {range: [0.7, 1.0], kind: heuristic}
+  constraints:
+    - "interpolate only if per_frame_motion_px * s < 0.05 * width (Twixtor FAQ)"
+    - "avoid optical flow below 10% speed (Premiere docs)"
+
+- id: blur.shutter
+  topic: motion_blur
+  sources: [{url: "https://helpx.adobe.com/after-effects/using/assorted-animation-tools.html", status: snippet}]
+  model: "blur_len_px = |v_px_per_frame| * angle/360 ; sample times t + phase + k*(angle/360)/fps/N"
+  parameters:
+    shutter_angle: {default: 180}
+    shutter_phase: {default: -90}
+    samples:       {default: 12, range: [8, 16], kind: heuristic}
+
+- id: transition.whip
+  topic: transition
+  sources: [{url: "https://creativecow.net/?p=2451776", status: snippet}]
+  parameters:
+    total_frames:  {default: 10, note: 5 before + 5 after cut}
+    blur_profile:  {value: "0 -> peak at cut -> 0"}
+    direction:     {from: reference_flow_angle}
+
+- id: beat.trigger_decay
+  topic: beat_sync
+  sources: [{url: "https://www.motionscript.com/design-guide/audio-trigger.html", status: verified}]
+  model: "t = time - last_rising_edge ; y = amp*sin(2*pi*freq*t)/exp(decay*t)"
+  parameters: {amp: 25, freq: 5, decay: 4, threshold: 10.0}
+
+- id: grade.lut_cube
+  topic: color_grade
+  sources: [{url: "https://colour.readthedocs.io/en/develop/_modules/colour/io/luts/iridas_cube.html", status: snippet}]
+  parameters:
+    lut_size: {default: 33}
+    order: {value: red_fastest}
+    domain: {min: [0,0,0], max: [1,1,1], note: "Resolve ignores DOMAIN_*"}
+
+# ---- added with video_agent/ae (clean-room AE matching) ----
+
+- id: ease.bezier
+  topic: easing
+  sources:
+    - {url: "https://www.w3.org/TR/css-easing-1/", status: verified}
+    - {url: "https://lottie.github.io/lottie-spec/latest/", status: verified}
+  takeaway: Keyframe easing is a cubic bezier with P0=(0,0), P3=(1,1); solve x(u)=progress, return y(u). Lottie stores it per keyframe as o (out of this key) and i (into the next).
+  model: "B(u) = 3(1-u)^2 u P1 + 3(1-u) u^2 P2 + u^3"
+  constraints: ["x1, x2 in [0, 1]"]
+
+- id: expr.wiggle
+  topic: camera_shake
+  sources:
+    - {url: "https://ae-expressions.docsforadobe.dev/objects/property/", status: verified}
+    - {url: "https://ae-expressions.docsforadobe.dev/general/random-numbers/", status: verified}
+  takeaway: wiggle(freq, amp, octaves=1, amp_mult=0.5, t=time) adds seeded smooth noise; octave k runs at freq*2^k with amp*amp_mult^k. AE's own noise function is unpublished, so the match is statistical, not bit-exact.
+  parameters:
+    octaves:  {default: 1, doc_default: 1}
+    amp_mult: {default: 0.5, doc_default: 0.5}
+
+- id: fx.bloom
+  topic: glow
+  sources:
+    - {url: "https://learnopengl.com/Advanced-Lighting/Bloom", status: verified}
+    - {url: "https://docs.blender.org/manual/en/latest/compositing/types/filter/glare.html", status: verified}
+  takeaway: Deep Glow-style glow = bright-pass in linear light, several Gaussian blurs of growing radius summed, added back (additive), then encoded to the display curve.
+  parameters:
+    threshold:  {default: 0.8, range: [0.5, 1.0], kind: heuristic}
+    knee:       {default: 0.1, kind: heuristic}
+    radii_w:    {default: [0.004, 0.012, 0.03, 0.07], kind: heuristic, note: share of frame width}
+    intensity:  {default: 0.6, range: [0, 2], kind: heuristic}
+
+- id: fx.vector_blur
+  topic: motion_blur
+  sources:
+    - {url: "https://api.crossref.org/works/10.1145%2F2159616.2159639", status: verified, note: "McGuire et al., A Reconstruction Filter for Plausible Motion Blur, I3D 2012"}
+    - {url: "https://revisionfx.com/products/rsmb/", status: verified}
+  takeaway: RSMB-style blur = per-pixel motion vectors, then average samples taken along each pixel's vector over the shutter interval (gather), in linear light.
+  model: "out(x) = mean_k in(x - v(x) * shutter * (k/(n-1) - 0.5))"
+  parameters:
+    shutter: {default: 0.5, note: "0.5 = 180 degrees"}
+    samples: {default: 12, range: [8, 16], kind: heuristic}
+
+- id: fx.flow_retime
+  topic: speed_ramp
+  sources:
+    - {url: "https://revisionfx.com/products/twixtor/", status: verified}
+    - {url: "https://arxiv.org/abs/2011.06294", status: snippet, note: RIFE}
+    - {url: "https://arxiv.org/abs/1712.00080", status: uncertain, note: "Super SloMo intermediate-flow approximation"}
+  takeaway: Twixtor-style retime = dense flow both ways, approximate the flow from the in-between time to each frame, backward-warp both frames and blend by time.
+  model: "F_t0 = -(1-t) t F_01 + t^2 F_10 ; F_t1 = (1-t)^2 F_01 - t (1-t) F_10 ; I_t = (1-t) warp(I_0, F_t0) + t warp(I_1, F_t1)"
+  constraints: ["interpolate only if per-frame motion < 5% of width (Twixtor FAQ), else blend"]
+
+- id: fx.parametric_shake
+  topic: camera_shake
+  sources:
+    - {url: "https://borisfx.com/documentation/sapphire/ae/shake/", status: verified}
+    - {url: "https://borisfx.com/blog/shake-effect-after-effects-tutorial/", status: verified}
+  takeaway: S_Shake parameter model; per axis offset = Amplitude * (RandAmp * noise(RandFreq * Freq * t + seed) + WaveAmp * sin(2 pi WaveFreq * Freq * t + phase)).
+  parameters:
+    frequency:    {default: 15, source: "Boris FX impact recipe"}
+    amplitude:    {default: 6, source: "Boris FX impact recipe, eased to 0"}
+    rand_amp_x:   {default: 100, source: "Boris FX impact recipe"}
+    rand_amp_y:   {default: 150, source: "Boris FX impact recipe"}
+    tilt_deg:     {default: 5, source: "Boris FX impact recipe"}
+    decay_frames: {default: 20, source: "Boris FX impact recipe"}

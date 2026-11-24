@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from .analysis.camera import motion_velocities
+from .analysis.transitions import gradual_cuts
 from .analysis.visual import detect_cuts, find_flashes, flash_aware_cuts, track_frames
 from .media import iter_frames, probe
 
@@ -258,6 +259,14 @@ def _flow(ref_flow, out_flow, hits: np.ndarray, fps: float) -> tuple[float, dict
     return score, info(pr, rr), info(po, ro)
 
 
+def _all_cuts(path: Path, flashes: list[float], fps: float) -> list[float]:
+    """Every shot change, found the way cloning finds them: hard cuts, plus gradual transitions (whips, slides,
+    masked reveals) by what the picture shows. With hard cuts only, a render that cut where the reference has a
+    gradual transition was scored as having extra cuts (BMW template v3: 5 of its 18 real cuts)."""
+    cuts = flash_aware_cuts(path, detect_cuts(path, fps), flashes, fps)
+    return sorted(cuts + gradual_cuts(path, fps, cuts))
+
+
 def style_match(reference: str | Path, output: str | Path) -> MatchReport:
     reference, output = Path(reference), Path(output)
     ri, oi = probe(reference), probe(output)
@@ -265,8 +274,8 @@ def style_match(reference: str | Path, output: str | Path) -> MatchReport:
 
     ref_track, out_track = track_frames(reference, fps), track_frames(output, oi.fps)
     ref_flashes, out_flashes = find_flashes(ref_track), find_flashes(out_track)
-    ref_cuts = flash_aware_cuts(reference, detect_cuts(reference, fps), ref_flashes, fps)
-    out_cuts = flash_aware_cuts(output, detect_cuts(output, oi.fps), out_flashes, oi.fps)
+    ref_cuts = _all_cuts(reference, ref_flashes, fps)
+    out_cuts = _all_cuts(output, out_flashes, oi.fps)
     bounds = _bounds(ref_cuts, ri.duration)
 
     parts = {

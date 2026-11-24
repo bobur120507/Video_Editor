@@ -29,8 +29,10 @@ log = logging.getLogger(__name__)
 # 3.00 s, flashes white, shows the rim, flashes again (3.10 s). Cut-out: the car shows at the bottom
 # 5 frames before the cut (4.77 s). Shorter versions put the biggest change after the cut and the cut
 # detector read it 2 frames late (McLaren v13).
-FRAMES = {"panel": (7, 2), "portal": (5, 5), "cutout": (5, 0)}
-PORTAL_BLUR = 0.004  # blur (sigma, share of the frame width) per unit of log zoom on the zoomed-in next shot
+FRAMES = {"panel": (7, 2), "portal": (5, 5), "cutout": (5, 0), "zoom": (3, 4), "silhouette": (0, 5)}
+# Blur (sigma, share of the frame width) per unit of log zoom on the zoomed-in next shot. 0.004 smeared 83% of the
+# frames around the BMW template's first portal (v3), whose own wheel arch stays crisp.
+PORTAL_BLUR = 0.0013
 # The cut-out car enters smaller and fainter, like the TikTok's small, blurred one. At 70% / 40% it read as
 # a cut of its own (detector score 27.4 > 27, McLaren v15 at 4.80 s); 55% / 60% scored 24.8.
 CUTOUT_START_SIZE = 0.5  # the cut-out car's size when it enters, growing to full size as it lands
@@ -41,9 +43,12 @@ def ease(u: float) -> float:
     return 1 - (1 - min(max(u, 0.0), 1.0)) ** 3
 
 
+STREAK = 0.5  # motion-blur length per pixel moved (a 180-degree shutter); 1.0 smeared the cut-outs (BMW template v3)
+
+
 def _streak(img: np.ndarray, dx: float, dy: float) -> np.ndarray:
     """Motion blur along (dx, dy) pixels."""
-    n = int(min(41, max(1, round(math.hypot(dx, dy)))))
+    n = int(min(41, max(1, round(STREAK * math.hypot(dx, dy)))))
     if n < 3:
         return img
     k = np.zeros((n, n), np.float32)
@@ -177,6 +182,15 @@ def _wheel_texts() -> np.ndarray:
     return _TEXTS
 
 
+def _iris(frame: np.ndarray) -> tuple[float, float, float]:
+    """A round opening for a portal when no wheel is clear: on the car's lower half, or the frame centre."""
+    h, w = frame.shape[:2]
+    box = vision.main_subject([cv2.resize(frame, (480, int(h * 480 / w)))]) if vision.available() else None
+    if box is None:
+        return w / 2, h / 2, 0.18 * w
+    return box.cx * w, (box.y0 + 0.65 * box.h) * h, 0.22 * box.w * w
+
+
 def portal_frame(a: np.ndarray, b: np.ndarray, u: float, wheel: tuple[float, float, float], flash: float = 0.0,
                  opening: bool = True) -> np.ndarray:
     """Next shot `b` zoomed into its wheel and `u` (0..1) of the way back out; the wheel's opening
@@ -242,16 +256,64 @@ def cutout_frame(a: np.ndarray, b: np.ndarray, mask: np.ndarray, u: float, prev_
     The car fades in over the first frames and grows from CUTOUT_START_SIZE to full size while it rises:
     entering at full size and opacity read as a cut of its own (4.80 s, McLaren v14)."""
     h, w = a.shape[:2]
-    sign = 1 if edge != "top" else -1
-    off, prev = (1 - ease(u)) * h * sign, (1 - ease(prev_u)) * h * sign
+    horizontal = edge in ("left", "right")
+    span, sign = (w, -1 if edge == "left" else 1) if horizontal else (h, 1 if edge != "top" else -1)
+    off, prev = (1 - ease(u)) * span * sign, (1 - ease(prev_u)) * span * sign
     k = CUTOUT_START_SIZE + (1 - CUTOUT_START_SIZE) * ease(u)
     cx, cy = w / 2, h / 2
-    m = np.float32([[k, 0, cx - k * cx], [0, k, cy - k * cy + off]])
+    ox, oy = (off, 0.0) if horizontal else (0.0, off)
+    m = np.float32([[k, 0, cx - k * cx + ox], [0, k, cy - k * cy + oy]])
     layer = cv2.warpAffine(b, m, (w, h), borderValue=0)
     alpha = cv2.warpAffine(mask, m, (w, h), borderValue=0)
-    layer, alpha = _streak(layer, 0, prev - off), _streak(alpha, 0, prev - off)
+    sx, sy = (prev - off, 0) if horizontal else (0, prev - off)
+    layer, alpha = _streak(layer, sx, sy), _streak(alpha, sx, sy)
     alpha = alpha * min(1.0, u / CUTOUT_FADE)
     return np.clip(a * (1 - alpha[..., None]) + layer * alpha[..., None], 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------- zoom-through and white silhouette
+
+ZOOM_IN = 2.2  # how far the previous shot zooms in before the cut (and the next shot zooms out from)
+ZOOM_SAMPLES = 7  # zoom-blur samples
+
+
+def _zoomed(img: np.ndarray, scale: float, blur_to: float) -> np.ndarray:
+    """img scaled about its centre, with zoom blur spread from `scale` to `blur_to`."""
+    h, w = img.shape[:2]
+    acc = np.zeros(img.shape, np.float32)
+    n = int(min(32, max(ZOOM_SAMPLES, abs(scale - blur_to) * w / 12)))  # one sample per ~12 px of spread: no stepping
+    for s_ in np.linspace(scale, blur_to, n):
+        m = np.float32([[s_, 0, w / 2 * (1 - s_)], [0, s_, h / 2 * (1 - s_)]])
+        acc += cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return np.clip(acc / n + 0.5, 0, 255).astype(np.uint8)
+
+
+def zoom_frame(a: np.ndarray, b: np.ndarray, u: float, prev_u: float, zoom_in: float = ZOOM_IN) -> np.ndarray:
+    """Zoom-through: the previous shot rushes in towards its centre, the next shot lands out of the same zoom."""
+    if u <= 0.5:
+        s0, s1 = 1 + (zoom_in - 1) * (2 * prev_u) ** 2, 1 + (zoom_in - 1) * (2 * u) ** 2
+        return _zoomed(a, s1, s0)
+    s0, s1 = zoom_in - (zoom_in - 1) * ease(2 * prev_u - 1), zoom_in - (zoom_in - 1) * ease(2 * u - 1)
+    return _zoomed(b, s1, s0)
+
+
+def zoom_amount(size: float) -> float:
+    """How far a zoom-through zooms, from the reference's measured zoom per frame (BMW: +0.016 / +0.021 ->
+    about 1.2x). A fixed 2.2x blurred the McLaren v2 edit far past the reference (2026-11-18)."""
+    return float(np.exp(np.clip(abs(size), 0.008, 0.05) * 10)) if size else 1.2
+
+
+def silhouette_frame(b: np.ndarray, mask: np.ndarray, strength: float) -> np.ndarray:
+    """The next shot with its car filled white (`strength` 0..1) and a soft glow around it."""
+    if strength <= 0:
+        return b
+    h, w = b.shape[:2]
+    glow = cv2.GaussianBlur(mask, (0, 0), 0.02 * w)
+    white = np.clip(mask + 0.6 * glow, 0, 1)[..., None] * strength
+    return np.clip(b * (1 - white) + 255 * white, 0, 255).astype(np.uint8)
+
+
+SILHOUETTE = (1.0, 0.75, 0.45, 0.2, 0.05)  # white strength on the cut frame and after (the BMW edit fades in ~5)
 
 
 # ---------------------------------------------------------------- applying them to rendered shots
@@ -281,11 +343,19 @@ def _writer(dst: Path, w: int, h: int, fps: int, encode: list):
         stdin=subprocess.PIPE)
 
 
+def _last_frame(path: Path, w: int, h: int) -> np.ndarray | None:
+    last = None
+    for last in _reader(path, w, h):
+        pass
+    return last
+
+
 def _first_frame(path: Path, w: int, h: int) -> np.ndarray | None:
     return next(iter(_reader(path, w, h, frames=1)), None)
 
 
-def apply(kind: str, prev: Path, nxt: Path, w: int, h: int, fps: int, encode: list, frames: int = 0, direction: str = "") -> bool:
+def apply(kind: str, prev: Path, nxt: Path, w: int, h: int, fps: int, encode: list, frames: int = 0, direction: str = "",
+          size: float = 0.0, flash: bool = False) -> bool:
     """Composite one transition across the cut between rendered shots `prev` and `nxt` (rewritten in place)."""
     pre, post = FRAMES[kind]
     if frames:
@@ -296,15 +366,22 @@ def apply(kind: str, prev: Path, nxt: Path, w: int, h: int, fps: int, encode: li
         return False
     wheel = mask = None
     if kind == "portal":
-        wheel = find_wheel(b0)
-        if wheel is None:
-            log.warning("portal transition: no wheel found in the next shot, plain cut instead")
-            return False
-    if kind == "cutout":
+        wheel = find_wheel(b0) or _iris(b0)  # no clear wheel: a round opening on the car (or the frame centre)
+    if kind == "silhouette" and size:
+        # The white car is whichever car matches the reference's white area: the BMW's 7.03 s is the previous
+        # shot's small, distant car over the next shot (3% of the frame), not the next shot's close-up (~40%).
+        a_last = _last_frame(prev, w, h)
+        options = [(m, which) for m, which in ((car_mask(b0), "next"), (car_mask(a_last) if a_last is not None else None, "prev"))
+                   if m is not None and m.mean() >= 0.005]
+        if options:
+            mask = min(options, key=lambda o: abs(o[0].mean() - size))[0]
+    if kind in ("cutout", "silhouette") and mask is None:
         mask = car_mask(b0)
         if mask is None or mask.mean() < 0.01:
-            log.warning("cut-out transition: no car found in the next shot, plain cut instead")
-            return False
+            if kind == "silhouette":
+                log.warning("silhouette transition: no car found in the next shot, plain cut instead")
+                return False
+            mask = np.ones(b0.shape[:2], np.float32)  # no car to cut out: the whole next shot slides in
     total = pre + post
 
     def compose(a: np.ndarray, b: np.ndarray, j: int) -> np.ndarray:
@@ -312,20 +389,28 @@ def apply(kind: str, prev: Path, nxt: Path, w: int, h: int, fps: int, encode: li
         if kind == "panel":
             return panel_frame(a, b, u, pu, direction or "top_right")
         if kind == "portal":
-            zoom_end = total - 3  # zoom out; a white flash in the opening; the rim; a second, softer flash
-            flash = 1.0 if j == zoom_end else 0.6 if j == zoom_end + 2 else 0.0
-            return portal_frame(a, b, min(1.0, (j + 1) / max(zoom_end, 1)), wheel, flash, opening=j <= zoom_end)
+            zoom_end = total - 3 if flash else total - 1  # with a flash: zoom out; flash; the rim; a softer flash
+            light = (1.0 if j == zoom_end else 0.6 if j == zoom_end + 2 else 0.0) if flash else 0.0
+            return portal_frame(a, b, min(1.0, (j + 1) / max(zoom_end, 1)), wheel, light, opening=j <= zoom_end)
+        if kind == "zoom":
+            return zoom_frame(a, b, u, pu, zoom_amount(size))
+        if kind == "silhouette":
+            return silhouette_frame(b, mask, SILHOUETTE[min(j - pre, len(SILHOUETTE) - 1)])
         return cutout_frame(a, b, mask, u, pu, direction or "bottom")
 
     out_prev, out_next = prev.with_name(prev.stem + "_tr.mp4"), nxt.with_name(nxt.stem + "_tr.mp4")
     writer = _writer(out_prev, w, h, fps, encode)
-    tail: deque = deque(maxlen=pre)
+    tail: deque = deque(maxlen=max(pre, 1))
     last_a = None
     for f in _reader(prev, w, h):
-        if len(tail) == pre:
+        if len(tail) == tail.maxlen:
             writer.stdin.write(tail[0].tobytes())
         tail.append(f)
         last_a = f
+    if pre == 0:  # nothing before the cut changes (a silhouette): write the held last frame as it is
+        for f in tail:
+            writer.stdin.write(f.tobytes())
+        tail.clear()
     for j, a in enumerate(tail):
         writer.stdin.write(compose(a, b0, j + (pre - len(tail))).tobytes())
     writer.stdin.close()

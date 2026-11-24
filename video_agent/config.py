@@ -33,6 +33,8 @@ class Settings(BaseSettings):
 
     ytdlp_cookies_file: str = ""
 
+    web_user_id: int = 0  # whose templates the web UI shows: 0 = the CLI's, or your Telegram id for the bot's
+
     meta_app_id: str = ""
     meta_app_secret: str = ""
     meta_access_token: str = ""

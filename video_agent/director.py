@@ -169,7 +169,7 @@ def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
                 score -= 0.3 if any(u == ci and start < b and a < end for u, a, b in used_ranges) else 0.0
                 options.append((score, c, start, end, key))
         if seg.transition_in == "portal":
-            options = _prefer_wheels(options)
+            options = _prefer_wheels(options, need)
         _, clip, start, end, key = max(options, key=lambda o: o[0])
         used[key] = used.get(key, 0) + 1
         used_ranges.append((key[0], start, end))
@@ -192,13 +192,16 @@ def plan_edit(blueprint: Blueprint, clip_paths: list[str | Path]) -> EditPlan:
 # A portal shot opens on a wheel (the TikTok's: a wheel close-up). CLIP is nearly always sure it sees
 # a wheel, even head-on where the wheels hide in shadow, so the wheel's size decides: full bonus from
 # a radius of BIG_WHEEL of the frame width (a close-up), little for a distant one.
-WHEEL_BONUS = 0.8
+WHEEL_BONUS = 1.6  # 0.8 still let a front view (no wheel visible) open the BMW's second portal
 BIG_WHEEL = 0.12
 WHEEL_CANDIDATES = 20  # best-ranked windows checked for a wheel (CLIP on ~100 patches each, ~4 s)
 
 
-def _prefer_wheels(options: list[tuple]) -> list[tuple]:
-    """Re-rank the best windows for a wheel-portal shot by how clearly their first frame shows a wheel."""
+def _prefer_wheels(options: list[tuple], need: float) -> list[tuple]:
+    """Re-rank the best windows for a wheel-portal shot by how clearly their first frame shows a wheel.
+
+    The bonus shrinks with a window too short for the shot and with soft footage: unscaled, a 0.20 s wheel
+    window won the BMW template's 0.63 s portal shot and was slowed 3.2x into a soft shot (v4, 2026-11-18)."""
     from .render.transitions import wheel
 
     top = sorted(options, key=lambda o: o[0], reverse=True)[:WHEEL_CANDIDATES]
@@ -207,7 +210,9 @@ def _prefer_wheels(options: list[tuple]) -> list[tuple]:
         frame = frame_at(clip.path, start + 0.02, width=540)
         _, circle = wheel(frame) if frame is not None else (0.0, None)
         size = circle[2] / frame.shape[1] if circle else 0.0
-        out.append((score + WHEEL_BONUS * min(1.0, size / BIG_WHEEL), clip, start, end, key))
+        fills = min(1.0, (end - start) / max(need, 1e-6))
+        bonus = WHEEL_BONUS * min(1.0, size / BIG_WHEEL) * fills ** 2 * clip.sharpness_between(start, end)
+        out.append((score + bonus, clip, start, end, key))
     return out
 
 

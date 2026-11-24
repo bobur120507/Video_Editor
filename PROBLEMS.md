@@ -1087,3 +1087,148 @@ Tests: 32 pass. Benchmark **97.6%** (before glows: 97.7%), cuts 100%; no glows d
 **Overall 70.7%** (v16 71.0%). Colour 21% → 20%: the scorer compares each shot's average colour, and the glow warms two shots for 9 frames. Cuts 96% with no extra detections; everything else unchanged.
 
 The glows land on the TikTok's own frames. The upper half's yellow jumps at 4.00s (4.9 → 9.9, held, back to 6.5 by 4.33s) and at 6.77s (12.3 → 17.4, eased off before the 7.07s cut). Frame by frame with the TikTok: `compare/glow_v17.png`. They are visibly gentler than the TikTok's golden sunset sky, because our top of frame is a house and trees, not open sky. Stronger is one setting (`render/glow.py` `MIDTONE`, `MAX_DARKEN`).
+
+## Part 9: a harder reference: the BMW garage edit (`crazy_edit/@ttsavebot_#1.mp4`, 2026-11-18)
+
+11.5 s, 576×1024, 30 fps: a BMW M4 in a red-lit night garage. Frame strips: `_results/edit2/frames_*.png`.
+
+### Ground truth (read frame by frame) vs what cloning captured
+
+| Time | What the editor did | Cloned |
+|---|---|---|
+| 0.63, 1.27, 1.90, 2.23, 2.60 | Hard cuts | ✓ all |
+| 1.40–1.80 | Stars over the dark interior (seat shot) | ✗ |
+| 3.20–3.67 | Headlights flare up bright | ✗ |
+| 3.70–3.97 | **Wheel portal:** the next shot (wheel) zooms out with the previous wide shot inside the wheel | cut found (3.77), type ✗ |
+| 4.40–4.63 | **Car cut-out slide:** the next shot's car (rear) slides in from the left | cut found late (4.60), type ✗ |
+| 5.07–5.27 | **Car cut-out slide** from the right (front, headlights) | ✗ missed |
+| 5.67–5.80 | Zoom-through into the headlight close-up | ✗ missed |
+| 6.33–6.50 | **Shape portal:** the wide garage shot appears through the headlight's curve and zooms out | cut found (6.37), type ✗ |
+| 7.03–7.30 | Hard cut; the previous car glows white and fades over the interior | cut ✓, glow ✗ |
+| 7.33–7.63 | Hard cut; the next car appears as a white glowing silhouette and fades in | cut ✓, glow ✗ |
+| 7.67, 8.30 | Hard cuts | ✓ |
+| 8.87–9.03 | The next shot's car rises in from below over the logo close-up | cut found (9.03), type ✗ |
+| 9.47–10.30 | **Wheel portal** (as 3.70); the inside dissolves into the real rim at 10.13–10.30 | ✗ missed |
+| 10.77–10.97 | **Car cut-out slide** from the right | ✗ missed |
+| everywhere | No zoom punches or shakes; motion is in the footage and the transitions | ✓ none |
+
+Cloning found **14 of 18 shots** and **0 of 10 transition types**. It also missed the stars and the white light flares.
+
+### Why
+
+1. **Gradual transitions are missed.** Masked slides and portals change the picture over 3–8 frames, so neighbouring frames always look alike. Comparing frames 6 apart (thumbnail, CLIP or geometric match) does not separate them from this edit's dark, blurry camera moves either: 5% of in-shot frames match as poorly as transitions do.
+2. **The transition types are not recognised.** The portal detector looks for one shrinking circle; this edit's portals open from a wheel arch and a headlight curve. Cut-out slides and glowing silhouettes have no detector at all.
+3. **Overlays (stars) and white light flares** have no detector. The glow detector only knows warm glows.
+
+### Baseline: applying the clone as it is (`_results/edit2/mclaren_v1.mp4`, render 18 min)
+
+**Match 67.8%**: cuts 83%, camera 36%, colour 71%, pace 51%, timing 73%, shake 76%, smooth 20%, flow 56%, sharp 100%. Frames side by side: `_results/edit2/compare_v1.png`. Every transition is a plain cut (no portals, slides or glowing silhouettes), and there are no stars or flares. The footage is a daytime rainy street; the reference is a red-lit night garage with interior close-ups the footage doesn't have (the director's filming advice says so).
+
+### Plan to upgrade cloning (proposed)
+
+1. **Find every transition, gradual ones too.** Hand-made measures don't separate this edit's transitions from its camera moves (above). TransNetV2 is a small, open model trained for exactly this, gradual transitions included (~30 MB, from GitHub, MIT licence). It needs a download, which needs your approval.
+2. **Recognise the transition type.** For each transition, work out per pixel which shot it shows, then read the shape and motion of the new shot's region:
+   - shrinking with the old shot inside it → portal (any shape, not only a circle);
+   - moving sideways or up → cut-out slide, with its direction;
+   - white and fading → glowing silhouette;
+   - growing from the centre → zoom-through.
+3. **Effects:** white light flares (the glow detector extended from warm to bright), and star overlays (small bright dots appearing on dark areas).
+4. **Rendering the new types:** shape portals and glowing silhouettes from the car's outline, cut-out slides from any direction, zoom-through. The wheel portal, bottom cut-out and corner panel exist already.
+
+### TransNetV2 downloaded and running; gradual transitions found; a correction (2026-11-18)
+
+**TransNetV2** (official weights from github.com/soCzech/TransNetV2, MIT; 36.5 MB in `tools/models/transnetv2/`, SHA-256 checked against the published values) runs in plain numpy (`analysis/transnet.py`, with `analysis/tfcheckpoint.py` reading the TensorFlow weights), so nothing else was installed. It takes 12 s for this 11.5 s edit.
+- **Checked on a synthetic video:** a 12-frame dissolve scores 0.86–0.99 on every frame and a hard cut 0.81, so the port works.
+- **On the BMW edit:** hard cuts 0.44–0.97, but **every masked transition (portals, cut-out slides, zoom-through) scored about 0**. It was trained on cuts and dissolves and has never seen object-masked transitions. It is kept as a module for dissolves, and not used for these.
+
+**What did find them:** what the picture *shows* (CLIP), averaged over 6 frames just before vs just after (`analysis/transitions.gradual_cuts`):
+- **On the BMW edit:** every gradual transition peaks at 0.159–0.341, in-shot moves at most 0.154 (threshold 0.155).
+- **Added cuts:** BMW 5.0, 5.63, 9.6, 10.23 (the portal's inside dissolving into the rim) and 10.8; TikTok 3.60, 3.97, 4.37, 5.47, all real shot changes hidden in whips (frames: `_results/edit2/tiktok_new_cuts.png`); reel_2 none; reel_1 none (with a 10-frame guard at the start and end).
+
+**Result:** the BMW edit is cloned with 19 shots (was 14; ground truth 18 plus the rim dissolve), the TikTok with 17 (was 13).
+
+**Correction: the TikTok has no beat glows.** Both "glows" (4.00s and 6.77s) were whips into new shots with a warmer sky; motion blur made the thumbnail check think the picture stayed the same. The glow detector now also requires CLIP to see the same shot (change below 0.13), and finds none in the TikTok. The glow *rendering* is unchanged, and still usable from the move review. v17's glows were therefore not something the TikTok's editor did, and the velocity work (v1–v17) used 13 of its 17 shots.
+
+### Transition types recognised (2026-11-18, not rendered)
+
+**Per-pixel "which shot" masks:** too noisy, because both shots keep moving during the transition. Right on slides from the right, wrong on portals and the left slide (`_results/edit2/masks_all.png`).
+
+**Motion during the transition** (optical flow, mean zoom of the 6 fastest frames) separates three types:
+
+| Zoom | Transitions | Type |
+|---|---|---|
+| −0.018 to −0.023 | BMW 3.77, 9.60; TikTok 2.97 | portal (zoom out of an opening) |
+| +0.016 to +0.021 | BMW 5.63, 6.37 | zoom-through |
+| −0.012 to +0.012 | slides, whips, hard cuts | — |
+
+**`analysis/transitions.classify`:**
+- **Portal:** zooms out, and its next shot shows a wheel (CLIP wheel check). reel_1's cartoon camera zoom-out has none: 0.00 against 0.99–1.00 for the portals.
+- **Zoom-through:** zooms in.
+- **Silhouette:** on the cut frame a pure-white blob covers ≥2% of the frame, absent just before and halved by the next frames. That is the BMW's white car at 7.03s and 7.33s.
+
+**Result:** on the BMW edit all 6 classified transitions are right, with no false ones; TikTok: its portal; reel_1 and reel_2: none.
+
+**Not detectable with any measure tried:** cut-out slides vs whips. Sideways flow, the share of the frame moving and region masks all overlap (slides 0.50–0.55, whips 0.38–0.72 moving share). They are marked in the move review instead, which now takes directions ("add 4.6 cut-out from left", "from below", "corner panel top left"). The BMW template has its 4 marked, and the review removed a false punch and shake at 5.13s (the slide's motion).
+
+**Stars and flares: not built.** The interior shot's camera barely moves (0.9 px), so an added star overlay cannot be told from the car's own starlight headliner. The headlight flares are the car's own lights.
+
+**Rendering the new types** (`render/transitions.py`):
+- **Zoom-through:** the previous shot rushes in with zoom blur and the next lands out of it (4 + 4 frames).
+- **Silhouette:** the next shot's car (YOLOX + GrabCut) is filled white with a soft glow on the cut frame, then fades over 5 frames.
+- **Cut-outs:** now from the left and right too.
+- **Whips:** a shaped transition replaces the whip at its cut (cloner and review), so the two no longer stack.
+
+Stills: `_results/edit2/new_types_stills.png`.
+
+Tests: 33 pass. Benchmark **97.7%**, cuts 100%: no false gradual cuts or transition types on its synthetic edits.
+
+### BMW template on the McLaren footage, v2: worse than plain cuts (57.1% vs 67.8%), and the fixes
+
+`_results/edit2/mclaren_v2.mp4` (25 min). All 10 transitions rendered (after fixing a crash: a transition with no frames before the cut). Side by side with the BMW edit (`_results/edit2/transitions_v2_*.png`):
+
+| Transition | BMW | v2 | Fix |
+|---|---|---|---|
+| Portals 3.77, 9.60 | zoom out of a wheel, **no flash** | TikTok-style white flashes; 9.60 opened on the hood of a front view | Each portal stores whether the reference flashes (white share rising >0.02: TikTok +0.05, BMW +0.001). The director's wheel preference is doubled (both portal shots now open on wheel close-ups). No clear wheel: a round opening on the car instead of a plain cut. |
+| Zoom-throughs 5.63, 6.37 | gentle push (~1.2×) | 2.2× with heavy blur | Zoom size taken from the reference's measured zoom per frame (exp(10 × zoom) ≈ 1.17–1.23) |
+| Silhouette 7.03 | a small, distant white car (3% of the frame) | the next close-up car all white (~40%) | The white car is whichever car (previous or next shot) is closest to the reference's white share; 10% on these stills |
+| Cut-out without a car | — | — | The whole next shot slides in instead of a plain cut |
+
+v2 lost points where the white areas read as flashes (flashes 100% → 0%) and the strong blur cost smoothness, flow and sharpness. Stills of the fixes: `_results/edit2/fixed_types_stills.png`. Tests: 34 pass.
+
+### BMW template v3 (`_results/edit2/mclaren_v3.mp4`, 26 min): level with plain cuts, once the scorer is fixed
+
+As first scored: **64.2%** (v1 67.8%, v2 57.1%). Not committed, as agreed.
+
+**The scorer was penalising real cuts.** It found the reference's cuts with the hard-cut detector only: 13 for the BMW edit, while cloning now knows 18. v3, which correctly cuts at all 18, was charged 5 "extra" cuts. The scorer now finds cuts the way cloning does, hard cuts plus CLIP-found gradual transitions, for both videos (`scoring._all_cuts`). Re-scored, the same files:
+
+| | Overall | Cuts | Colour | Shake | Sharp | Smooth | Flow |
+|---|---|---|---|---|---|---|---|
+| v1 (plain cuts) | 64.8% | 71% | 66% | 76% | 100% | 20% | 56% |
+| v2 | 57.3% | 77% | 70% | 88% | 60% | 6% | 10% |
+| v3 | 64.6% | **82%** | 70% | **93%** | 67% | 0% | 27% |
+
+v3 wins on cuts, colour and shake, and loses everything else to blur: 47% of its frames are smeared (BMW 35%). The worst is 83% around the first portal, whose zoomed-in shot is blurred while the BMW's wheel arch stays crisp; then the cut-outs' motion streaks.
+
+**Fixed after:** portal blur cut to a third (`PORTAL_BLUR` 0.004 → 0.0013); cut-out motion streaks halved (a 180° shutter, `STREAK` 0.5).
+
+Tests: 34 pass. Benchmark **97.7%**, cuts 100% with the new scorer: its synthetic edits get no false gradual cuts.
+
+### BMW template v4 (`_results/edit2/mclaren_v4.mp4`, 26 min): 63.6% (v1 64.8%, v3 64.6% on the fixed scorer). Not committed.
+
+Halving the transition blur did not change the smeared share (v3 47%, v4 47%; v1 36%; BMW 35%). Per shot, the extra smear is footage choice, not transitions. The scorer's "smeared" is relative to the video's own sharpest frames, and the McLaren footage has very sharp close-ups (≈10,000) next to soft, rainy wide shots (1,300–3,400); the BMW edit is evenly soft (p90 ≈ 250).
+- **v4's softer shots** are those whose footage changed: the second portal (the stronger wheel preference chose a softer wheel window: 7,971 → 2,250), the last shot (4,663 → 2,568), and the wide shots at 1.27s and 2.60s.
+- **The transitions themselves** win on cuts (71% → 82%), colour (66% → 70%) and shake (76% → 88%), and lose on sharp, smooth and flow through those footage changes.
+
+**Where this leaves it:** on this footage, plain cuts and the BMW's transitions score within about 1 point. The transitions match the reference's structure (cuts 82%, all 10 types present); the score difference is footage choice. Next options: let the director weigh sharpness against the wheel preference; or judge v1 vs v4 by eye, which this metric cannot settle.
+
+### BMW template v5 (`_results/edit2/mclaren_v5.mp4`, 27 min): 64.6%, level with plain cuts (v1 64.8%)
+
+The director's wheel preference for portal shots now scales with how much of the shot the window fills (squared) and how sharp it is. v4's second portal had a 0.20 s window slowed 3.2× into 0.63 s; now both portals get full-length, sharp wheel shots (sharpness 0.97 and 0.83, no stretch).
+
+| | Overall | Cuts | Colour | Shake | Sharp | Smooth | Flow | Smeared frames |
+|---|---|---|---|---|---|---|---|---|
+| v1 (plain cuts, old clone) | 64.8% | 71% | 66% | 76% | 100% | 20% | 56% | 36% |
+| v4 | 63.6% | 82% | 70% | 88% | 67% | 0% | 25% | 47% |
+| **v5** | 64.6% | **82%** | **70%** | **82%** | **96%** | 0% | 24% | 39% |
+
+Sharpness is fixed. What is left of the gap is smooth and flow, which the transitions' fast motion at the cuts costs (the scorer rewards a motion wave like the reference's own). On this footage the two versions are within 0.2 points: this metric cannot pick between them, and looking at them is the test. Tests: 34 pass.

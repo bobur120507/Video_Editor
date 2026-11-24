@@ -16,7 +16,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .blueprint import Blueprint, EditEvent, Glow, Segment, SpeedPoint
+from .blueprint import Blueprint, EditEvent, Glow, Segment, SpeedPoint, clear_whips
 from .media import ffmpeg
 
 KIND_WORDS = {
@@ -29,12 +29,17 @@ KIND_WORDS = {
     "panel": "Corner panel (next shot grows in from a corner)",
     "portal": "Wheel portal (next shot zooms out of its wheel)",
     "cutout": "Car cut-out (next shot's car rises in)",
+    "zoom": "Zoom-through (previous shot zooms into the next)",
+    "silhouette": "White silhouette (the car flashes white on the cut and fades in)",
     "glow": "Glow (picture turns warm and golden on the beat)",
 }
 SCREEN = {"whip": "WHIP", "punch": "PUNCH", "shake": "SHAKE", "push": "ZOOM", "flash": "FLASH", "slowmo": "SLOW-MO",
-          "panel": "PANEL", "portal": "PORTAL", "cutout": "CUT-OUT", "glow": "GLOW"}
-TRANSITIONS = ("panel", "portal", "cutout")  # shown at a cut and stored as Segment.transition_in
+          "panel": "PANEL", "portal": "PORTAL", "cutout": "CUT-OUT", "glow": "GLOW", "zoom": "ZOOM-THROUGH",
+          "silhouette": "SILHOUETTE"}
+TRANSITIONS = ("panel", "portal", "cutout", "zoom", "silhouette")  # shown at a cut and stored as Segment.transition_in
 SYNONYMS = [
+    (r"silhouette|white car|car flash", "silhouette"),
+    (r"zoom.?through|zoom into|zoom transition", "zoom"),
     (r"glow|shine|shiny|golden|light ?leak|gleam", "glow"),
     (r"cut.?out|car (?:rise|fl[yi])|rises? in|detach", "cutout"),
     (r"portal|wheel|iris|circle|rim", "portal"),
@@ -160,7 +165,7 @@ def apply_corrections(bp: Blueprint, text: str) -> tuple[Blueprint, list[str]]:
         elif m := re.match(r"(?:add|\+)\s*([\d.]+)\s*s?\s+(.+)$", part, re.I):
             kind = _kind(m.group(2))
             if kind:
-                t = _add(bp, float(m.group(1)), kind)
+                t = _add(bp, float(m.group(1)), kind, _direction(m.group(2)))
                 done.append(f"added {KIND_WORDS[kind]} at {t:.2f}s")
         elif m := re.match(r"#?(\d+)\s*(?:=|is|->|:)?\s*(?:a |an )?(.+)$", part, re.I):
             n, kind = int(m.group(1)), _kind(m.group(2))
@@ -198,7 +203,18 @@ def _remove(bp: Blueprint, move: Move) -> None:
         seg.speed = [SpeedPoint(at=0.0, speed=1.0)]
 
 
-def _add(bp: Blueprint, t: float, kind: str) -> float:
+def _direction(text: str) -> str:
+    """"from the left" -> "left"; corners for panels ("top right"); "" when none is said."""
+    m = re.search(r"\b(top|bottom|upper|lower)?[ -]?(left|right)\b|\b(top|bottom|below|above)\b", text, re.I)
+    if not m:
+        return ""
+    if m.group(2):
+        v = (m.group(1) or "").lower().replace("upper", "top").replace("lower", "bottom")
+        return f"{v}_{m.group(2).lower()}" if v else m.group(2).lower()
+    return {"below": "bottom", "above": "top"}.get(m.group(3).lower(), m.group(3).lower())
+
+
+def _add(bp: Blueprint, t: float, kind: str, direction: str = "") -> float:
     """Add a move at about `t` (snapped to a music hit, or to the nearest cut for transitions); returns where it went."""
     hits = bp.audio.hits
     near = min(hits, key=lambda h: abs(h - t)) if hits else t
@@ -217,7 +233,8 @@ def _add(bp: Blueprint, t: float, kind: str) -> float:
             seg.transition_in, seg.flash_frames = "flash", seg.flash_frames or 4
         elif kind in TRANSITIONS:
             seg.transition_in = kind
-            seg.transition_from = seg.transition_from or {"panel": "top_right", "cutout": "bottom"}.get(kind, "")
+            clear_whips(bp.segments, i)
+            seg.transition_from = direction or seg.transition_from or {"panel": "top_right", "cutout": "bottom"}.get(kind, "")
         return cut
     i, seg = _seg_at(bp, t)
     fps = seg.camera.fps if seg.camera else bp.source.fps or 30.0

@@ -4,7 +4,7 @@ Status of every roadmap item. `[x]` done and tested · `[~]` partly done · `[ ]
 Updated after each milestone. The **core goal is matching the cloned video's edit as closely as possible**, so the
 Matching Engine sections come first; publishing comes last.
 
-Last updated: 2026-11-17 (milestone: velocity edits P7, grade on the framed picture, cut detector)
+Last updated: 2026-11-24 (milestone: web UI with the stored audio graph; research in `docs/`)
 
 ---
 
@@ -101,6 +101,15 @@ Done on 2026-11-14 after your answers (details and numbers in PROBLEMS.md Part 4
 - [x] Beat glows: detected in the reference (the TikTok's 2, none on the reels) and rendered as a warm golden sky + highlight bloom on the same beats; in the move review ("add 8.0 glow")
 - [x] Seventeenth velocity test edit (`velocity_test/mclaren_velocity_v17.mp4`): beat glows on the TikTok's frames (4.00s, 6.77s); 70.7% (colour −1: the scorer reads the warm frames as off-colour)
 - [ ] Detect corner panels and car cut-outs automatically (needs more reference edits to learn from)
+- [x] Second, harder reference cloned and applied: BMW garage edit (`@ttsavebot_#1.mp4`). Cloning found 14 of 18 shots and 0 of 10 transition types; baseline on the McLaren footage 67.8% (`_results/edit2/mclaren_v1.mp4`). Ground truth and gaps: PROBLEMS.md Part 9
+- [x] Gradual transitions found by CLIP change (BMW 14 → 19 shots, TikTok 13 → 17). TransNetV2 downloaded and running (numpy, no TensorFlow); it finds cuts and dissolves but not masked transitions
+- [x] Correction: the TikTok's two "beat glows" were whips into warmer shots; the glow detector now also requires CLIP to see the same shot
+- [x] Transition types: portal (zoom-out + wheel), zoom-through, white silhouette classified automatically (BMW 6/6, no false ones on 4 references) and rendered; cut-out slides from any side marked in the move review (no measure tells them from whips); a typed transition replaces the whip at its cut
+- [ ] Stars / flares: undecidable from one example (camera static; the flares are the car's own lights)
+- [x] BMW template on McLaren with the new types, v2: 57.1% (baseline 67.8%): flashes, too-strong zooms, a too-big silhouette. Fixed after: per-transition flash / zoom size / silhouette size measured from the reference; wheel footage for portals
+- [x] BMW template v3: 64.2%; the scorer was charging the 5 newly found real cuts as extra. Scorer now finds gradual cuts too (both videos): v1 64.8%, v3 64.6% (v3 wins cuts/colour/shake, loses to blur). Blur fixed after: portal blur ÷3, cut-out streaks ÷2. Benchmark 97.7%
+- [x] BMW template v4: 63.6% (v1 64.8%): blur cut didn't change smear; the gap is footage choice (portal wheel preference picked softer windows). Not committed
+- [x] Director: the portal wheel preference scales with window fill and sharpness. v5 64.6% (v1 64.8%): sharp 67 → 96%, smeared 47 → 39%; the 0.2-point gap is smooth/flow from transition motion
 - [ ] P7 follow-up if still jerky: rebuild moves as one spline path instead of bumps on the drift
 - [ ] 5 more reference edits (you), then tune detection on them and the move reviews
 - [ ] Faster upscaling (22 min render): tile tuning or upscale only the used frames once per clip
@@ -242,6 +251,29 @@ When you have no footage: find clips/images that match each reference shot (~95%
 - [x] Forward a finished video → reuse its style
 - [~] `/publish`: caption + hashtags only; posting waits for Meta
 - [ ] GIF previews in the template gallery (uses the last MP4 render now)
+
+## H2. Web UI (`video-agent web`, `video_agent/web/`)
+
+- [x] Same pipeline as the bot in a browser: clone (file or link) → move review ("remove 3", "4 shake", "add 2.4 punch", ✅ stored as ground truth) → save template → apply (clips, on-screen text, changes) → video, cover, grid → match score → typed re-render and the four one-tap ratings. Templates: open, apply, rename, delete
+- [x] Audio graph on one time axis: waveform, dB mel spectrogram (64 bands), low/mid/high band energy in dB, onset strength (with a square-root "boost quiet onsets" view), beats, kick/snare hits, drops, cuts with transition names, numbered moves. Click seeks the video, drag pans, Ctrl/⌘+scroll zooms, hover reads the values
+- [x] Graph data computed once at clone time and stored in `Blueprint.audio.graph` (~1 s per clone, ~5 KB per second of video); older templates get a one-time "analyse and store" button
+- [x] Moves shown over the playing video ("#3 PUNCH"), so review needs no annotated render
+- [x] Tests: graph content (kicks in the low band, hats 40 dB quieter still show as onsets), markers, the whole clone/review/template and apply/change/rate API with a stubbed renderer, graph backfill. Checked in the browser on the sample reference (light and dark, phone width)
+- [ ] Not tried yet: uploading a clone and a real render through the site (the sample was cloned with the CLI and opened in the site; the apply API is tested with a stubbed renderer)
+- [ ] No login: binds to 127.0.0.1 by default; put it behind auth before exposing it
+- [x] Research in `docs/`: related open projects with licences and what to reuse (`research.md`), editing techniques, datasets and papers for the agent (`learning-sources.md`), and the After Effects reverse-engineering question
+
+## H3. Matching After Effects (`video_agent/ae/`, `video_agent/knowledge/`)
+
+- [x] Knowledge index in the package (`knowledge/techniques.yaml`, 13 techniques, each with sources and how sure); AE code takes its defaults from it
+- [x] AE expressions and easing as numpy: bezier (CSS spec value checked), linear/ease/easeIn/easeOut, wiggle, loopOut ×4, smooth, spatial paths
+- [x] Bodymovin/Lottie import → template (CLI `import-ae`, site Clone page). Rendered zoom/rotation within 0.04 % / 0.003° of the AE keyframes (end-to-end test)
+- [x] `.aep` import with py-aep (installed; optional extra `.[ae]`): same template as the Bodymovin export of the same edit; AE's Easy Ease matches our bezier within 0.013 % (both in tests)
+- [ ] `.aep` saved by a real, recent After Effects: none available to test (projects written by py-aep only; a pre-2018 file does not parse)
+- [~] `.mogrt` controls reader (CLI `mogrt`): tested on hand-made files only, no real .mogrt yet
+- [~] Bloom, motion-vector blur, flow retime, parametric shake in `ae/effects.py`: tested and measured, not wired into renders (vector blur matches a true shutter; flow retime ties `minterpolate` on average but has worse worst frames; no glow reference to tune bloom against)
+- [ ] Flash renders as 1 full + fading frames; an AE comp's 2 full-white frames come out 1 full + 1 half
+- [ ] The director is rule-based (no LLM), so the knowledge index has no prompt to go into yet; `knowledge.brief()` is ready for one
 
 ## I. Waiting on the Meta API key
 

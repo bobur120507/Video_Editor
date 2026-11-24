@@ -16,7 +16,17 @@ BLUEPRINT_VERSION = 1
 Effect = Literal["zoom_punch", "shake", "flash"]
 # panel: the next shot enters as a window growing from a corner; portal: the next shot zooms out of its
 # wheel with the previous shot inside the wheel's opening; cutout: the next shot's car, cut out, rises in.
-Transition = Literal["cut", "flash", "zoom", "panel", "portal", "cutout"]
+# zoom: the previous shot zooms into the next (zoom-through); silhouette: on the cut the car shows as a white
+# silhouette that fades into the picture.
+Transition = Literal["cut", "flash", "zoom", "panel", "portal", "cutout", "silhouette"]
+SHAPED = ("panel", "portal", "cutout", "zoom", "silhouette")  # transitions that replace a whip at their cut
+
+
+def clear_whips(segments: list["Segment"], i: int) -> None:
+    """A shaped transition at segment i's start is the move there: no whip out of the shot before, none in."""
+    segments[i].events = [e for e in segments[i].events if e.kind != "whip_in"]
+    if i:
+        segments[i - 1].events = [e for e in segments[i - 1].events if e.kind != "whip_out"]
 
 
 class SourceInfo(BaseModel):
@@ -29,6 +39,28 @@ class SourceInfo(BaseModel):
     path: str = ""  # local copy of the reference, used for match scoring
 
 
+class AudioGraph(BaseModel):
+    """The reference's sound over time, drawn by the web graph (analysis/audio.py: audio_graph).
+
+    Computed once at clone time so the site never re-analyses audio. Column i is at i / fps seconds.
+    """
+
+    fps: float  # columns per second (22050 Hz / 512 hop = 43, finer than a video frame)
+    wave_min: list[float] = Field(default_factory=list)  # lowest sample around each column, -1..1
+    wave_max: list[float] = Field(default_factory=list)
+    loudness: list[float] = Field(default_factory=list)  # RMS, dB below full scale
+    onset: list[float] = Field(default_factory=list)  # onset strength 0..1: ticks, hats and quiet hits show here too
+    low: list[float] = Field(default_factory=list)  # band energy in dB vs the loudest band moment: < 150 Hz (kick, 808)
+    mid: list[float] = Field(default_factory=list)  # 150-1500 Hz (body, vocals)
+    high: list[float] = Field(default_factory=list)  # 1.5-11 kHz (snare, clap, hats)
+    mel_hz: list[float] = Field(default_factory=list)  # centre frequency of each spectrogram row, low to high
+    spec: str = ""  # base64 uint8 mel spectrogram, row-major (len(mel_hz) rows x columns); 0 = floor_db, 255 = 0 dB
+    floor_db: float = -80.0  # dB (vs the loudest bin) that byte 0 stands for
+
+    def __len__(self) -> int:
+        return len(self.onset)
+
+
 class AudioInfo(BaseModel):
     bpm: float = 0.0
     beats: list[float] = Field(default_factory=list)
@@ -38,6 +70,7 @@ class AudioInfo(BaseModel):
     sync_to: str = ""  # the drum the reference editor cut on, when the cuts follow one
     track_path: str | None = None  # extracted music track, reused at apply time
     has_music: bool = False
+    graph: AudioGraph | None = None  # waveform, spectrogram and band energy for the web graph (None on older blueprints)
 
 
 class SpeedPoint(BaseModel):
@@ -126,6 +159,9 @@ class Segment(BaseModel):
     flash_frames: int = 0  # length of the white flash-in when transition_in == "flash"
     transition_frames: int = 0  # panel/portal/cutout: frames of the transition (0 = its default)
     transition_from: str = ""  # panel: the corner it grows from ("top_right"...); cutout: the edge it rises from
+    # As measured in the reference: zoom-through, zoom per frame; silhouette, share of the frame that turns white.
+    transition_size: float = 0.0
+    transition_flash: bool = False  # portal: a white flash in the opening as it lands (the TikTok's yes, the BMW's no)
     events: list[EditEvent] = Field(default_factory=list)
     subject: Subject | None = None  # where the car/person is and how big, in the reference shot
     clip: list[float] = Field(default_factory=list)  # CLIP embedding: what kind of shot this is

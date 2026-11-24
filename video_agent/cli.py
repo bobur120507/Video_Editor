@@ -1,4 +1,4 @@
-"""Command line: video-agent clone|apply|templates|caption|bot."""
+"""Command line: video-agent clone|apply|templates|caption|bot|web."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import sys
+import zipfile
 from pathlib import Path
 
 from . import storage
@@ -118,6 +119,40 @@ async def cmd_migrate_db(args) -> None:
     print("Copied: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
 
 
+async def cmd_import_ae(args) -> None:
+    from .ae import aep, lottie
+
+    path = Path(args.file)
+    name = args.name or path.stem
+    if not path.is_file():
+        sys.exit(f"No such file: {path}")
+    try:
+        bp = aep.to_blueprint(path, name, args.comp) if path.suffix.lower() == ".aep" else lottie.to_blueprint(path, name)
+    except (ValueError, RuntimeError) as e:  # unreadable project, unknown comp, py-aep missing
+        sys.exit(str(e))
+    row = await storage.save_blueprint(LOCAL_USER, bp)
+    await storage.save_template(LOCAL_USER, name, row.id)
+    print(f"Saved template '{name}' (blueprint #{row.id}) from {bp.source.origin}\n{bp.summary()}")
+    for note in bp.notes:
+        print(f"note: {note}")
+
+
+async def cmd_mogrt(args) -> None:
+    from .ae.mogrt import read
+
+    if not Path(args.file).is_file():
+        sys.exit(f"No such file: {args.file}")
+    try:
+        m = read(args.file)
+    except (ValueError, zipfile.BadZipFile) as e:
+        sys.exit(f"{args.file}: {e}")
+    print(f"{m.name}: {len(m.controls)} controls")
+    for c in m.controls:
+        print(f"  [{c.kind}] {c.name}: {c.value!r}")
+    if m.texts:
+        print("Use its text at /apply:  " + " ".join(f'--text "{t}"' for t in m.texts))
+
+
 async def cmd_show(args) -> None:
     tpl = await storage.get_template(LOCAL_USER, nickname=args.template)
     if not tpl:
@@ -153,6 +188,16 @@ def main() -> None:
 
     sub.add_parser("templates", help="List saved templates").set_defaults(fn=cmd_templates)
 
+    p = sub.add_parser("import-ae", help="Make a template from an After Effects project (.aep) or a Bodymovin export (.json)")
+    p.add_argument("file")
+    p.add_argument("--name")
+    p.add_argument("--comp", help=".aep: the composition to import (default: the top-level comp with the most footage)")
+    p.set_defaults(fn=cmd_import_ae)
+
+    p = sub.add_parser("mogrt", help="List the controls a Motion Graphics Template (.mogrt) exposes")
+    p.add_argument("file")
+    p.set_defaults(fn=cmd_mogrt)
+
     p = sub.add_parser("show", help="Print a template's blueprint JSON")
     p.add_argument("template")
     p.set_defaults(fn=cmd_show)
@@ -185,6 +230,10 @@ def main() -> None:
 
     sub.add_parser("bot", help="Run the Telegram bot")
 
+    p = sub.add_parser("web", help="Run the web UI (clone, review, apply, audio graph)")
+    p.add_argument("--host", default="127.0.0.1", help="Address to listen on (default: this machine only)")
+    p.add_argument("--port", type=int, default=8080)
+
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
@@ -192,6 +241,11 @@ def main() -> None:
         from .bot import run_bot
 
         asyncio.run(run_bot())
+        return
+    if args.cmd == "web":
+        from .web.app import run
+
+        run(args.host, args.port)
         return
 
     async def runner():
