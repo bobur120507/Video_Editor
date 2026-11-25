@@ -86,6 +86,14 @@ def probe(path: str | Path) -> Probe:
 STANDARD_FPS = (23.976, 24, 25, 29.97, 30, 50, 59.94, 60)
 
 
+def audio_duration(path: str | Path) -> float:
+    """Length of a sound file (or any media) in seconds; MediaError when it has no audio."""
+    data = json.loads(run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)]))
+    if not any(s.get("codec_type") == "audio" for s in data.get("streams", [])):
+        raise MediaError(f"No audio in {Path(path).name}")
+    return float(data.get("format", {}).get("duration") or 0.0)
+
+
 def constant_fps_copy(path: str | Path, dest_dir: str | Path) -> Path:
     """Return `path`, or a constant-frame-rate copy of it when it is variable or off-standard."""
     info = probe(path)

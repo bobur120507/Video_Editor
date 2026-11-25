@@ -6,21 +6,24 @@ The agent watches a short vertical video (Reel, TikTok, Short) and writes down i
 cuts and their timing against the music, speed ramps, zoom punches, whips, shake, flashes,
 transitions and colour grade. It saves all of that as a reusable **Edit Blueprint**. Give it your
 raw clips and it renders a 1080×1920 edit in that style, plus a cover, a grid crop and a score for
-how closely it matched. You can drive it from a **web UI**, a **Telegram bot** or the **command line**.
-It runs on one Linux machine with no After Effects, and it can also import After Effects projects as templates.
+how closely it matched. Then **edit the result yourself** in the browser (move cuts, swap footage,
+change speed, framing, moves and text) or **export it** to CapCut, After Effects, Premiere Pro,
+DaVinci Resolve or Final Cut Pro. You can drive it from a **web UI**, a **Telegram bot** or the
+**command line**. It runs on one Linux machine with no After Effects, and it can also import After
+Effects projects as templates.
 
 ---
 
 ## Results on real Reels
 
 Each clip is a few seconds of a **real render** made by the agent. Click a GIF to open the full
-clip with sound. The left panel is the original Reel, the middle panel is the agent's rebuild from
-the Reel's own footage, and the right panel is the same blueprint applied to different footage.
+clip with sound. The left panel is the original Reel, and the right panel is the agent's rebuild
+from the Reel's own footage.
 
 ### reel_1: cartoon "aura" edit (37 s, 29 shots, 99 BPM)
 
 <p align="center">
-  <a href="docs/media/reel_1.mp4"><img src="docs/media/reel_1.gif" alt="reel_1 side by side" width="720"></a>
+  <a href="docs/media/reel_1.mp4"><img src="docs/media/reel_1.gif" alt="reel_1: the reference Reel and the agent's rebuild, side by side" width="600"></a>
 </p>
 
 | Rebuild vs reference | Pixel SSIM | Match score | Breakdown |
@@ -34,7 +37,7 @@ The reference was a recompressed 576×576 download. The rebuild is a 1080×1080 
 ### reel_2: "Yo Jordan" looksmax edit (23 s, 22 shots, 129 BPM)
 
 <p align="center">
-  <a href="docs/media/reel_2.mp4"><img src="docs/media/reel_2.gif" alt="reel_2 side by side" width="720"></a>
+  <a href="docs/media/reel_2.mp4"><img src="docs/media/reel_2.gif" alt="reel_2: the reference Reel and the agent's rebuild, side by side" width="600"></a>
 </p>
 
 | Rebuild vs reference | Pixel SSIM | Match score | Breakdown |
@@ -43,10 +46,6 @@ The reference was a recompressed 576×576 download. The rebuild is a 1080×1080 
 | **Now** | **96.7 %** | **96.4 %** | cuts 100 · camera 92 · colour 94 · pace 99 |
 
 The blueprint holds 20 slow push-ins, 19 rotation sways and a drop, and the rebuild is made from it alone.
-
-The right-hand panels are a style-transfer test. reel_1's blueprint cut reel_2's clips, and
-reel_2's blueprint, including its muted colour grade, cut reel_1's cartoon. They aren't scored,
-because there is no ground truth for "how reel_1 would have edited these clips". Judge them by eye.
 
 ### Your footage: a McLaren clip in the style of a pro TikTok car edit
 
@@ -99,6 +98,53 @@ The graph has these lanes, all on one time axis:
 - **Onsets**, with kick (blue), snare (green) and both (orange) hits.
 
 Beat, cut and drop lines run through every lane, so you can see that the cuts follow the snare.
+
+### Edit it yourself
+
+Every render opens in the editor: press **✂️ Edit it yourself** under the finished video, or pick
+it under **Edits** in the menu.
+
+<p align="center">
+  <img src="docs/media/web_editor_timeline.png" alt="Editor timeline: shot thumbnails with their transitions, a text block, the music lane with drum hits, and the playhead" width="860">
+</p>
+
+- **Timeline**: shots with thumbnails, the text track and the music lane with its drum hits. Drag a
+  cut and it snaps to the nearest beat or hit (hold Alt to place it freely). Drag a text's ends to
+  retime it.
+- **Shot inspector**: change the footage and where in the clip the shot starts (with a frame
+  preview), the framing, the speed, the transition into it, and its moves (punch, shake, whip,
+  push, flash, slow-mo, glow). You can also split it, remove it, or swap its footage with a neighbour.
+- **Edits keep the music sync.** Moving a cut gives one shot's time to its neighbour. Removing a
+  shot lets the one before take its place. Swapping footage leaves every cut where it was. Each
+  shot's moves and speed ramps stay at their moment in time.
+- **Quick preview** plays your clips in the browser at their cuts, speeds and framing, with the
+  text and simple versions of the moves. **Render again** makes the real edit, with the grade,
+  glows and motion smear. You can undo and redo every change, even after a restart.
+- **Look**: brightness, contrast, saturation, warmth and move strength, plus beat glows, shaped
+  transitions and motion blur on or off. You can also add clips or replace the music.
+
+### Take it to another editor
+
+| Export | Opens in | What carries over |
+|---|---|---|
+| **CapCut kit** (zip) | CapCut desktop, web and phone | One ready-cut, ready-framed clip per shot, numbered. Drop them all on the timeline and the cuts land on the beat. Also the music trimmed to the edit, the text as `.srt`, and the agent's render |
+| **After Effects** (`.jsx`) | After Effects: File > Scripts > Run Script File | A comp with every shot at its speed and framing. Punches, pushes, shakes and whips become keyframes, flashes a white solid, plus text layers, the music, and the agent's render as a guide layer |
+| **Premiere / Resolve XML** | Premiere Pro, DaVinci Resolve | Cuts, speed (as Time Remap), framing, text, flashes, music |
+| **FCPXML 1.10** | Final Cut Pro, DaVinci Resolve | Cuts, speed (as a timeMap), framing, titles, music, transition markers |
+| **OpenTimelineIO** | Resolve 18.5+, Premiere 26+, Kdenlive 25.04+, Avid | Cuts, speed, music, markers for text, moves and transitions |
+| **EDL** | Any editor | Cuts and speeds |
+| **Everything** (zip) | All of the above | Every format plus your clips, the music and the agent's render, with a how-to |
+
+If you'll open the files on another computer, type the folder you'll unzip to (for example
+`C:\Users\you\Desktop\my_edit`), and they'll find the media without relinking.
+
+CapCut imports no timeline file. Its help says projects from other editors can't be brought in,
+and the draft files that community tools write are reverse-engineered and reportedly break on
+CapCut 10. So the kit hands CapCut what it always imports: plain clips, already cut.
+
+The colour grade, beat glows, motion smear and the shaped transitions (wheel portal, corner panel,
+cut-out) are made by the agent's own renderer. They don't fit any timeline format, so they're in
+the agent's render that ships with every export.
 
 ---
 
@@ -288,7 +334,9 @@ apply   Blueprint + your clips
 | `video_agent/scoring.py` · `bench.py` · `realtest.py` | Match score, ground-truth benchmark, real-Reels test |
 | `video_agent/ae/` | After Effects: easing and expression functions, `.aep`/Lottie import, safe expression interpreter, `.mogrt`, bloom, motion-vector blur, optical-flow retime |
 | `video_agent/knowledge/` | `techniques.yaml`: editing techniques with parameters and the source each came from |
-| `video_agent/web/` | Web UI (aiohttp, no extra install); `static/graph.js` draws the audio graph |
+| `video_agent/web/` | Web UI (aiohttp, no extra install); `static/graph.js` draws the audio graph; `editor.py` + `static/editor.js` are the editor |
+| `video_agent/project.py` | An edit as a project: shots, footage, in-points, framing; the edit operations, undo/redo, re-render without re-planning |
+| `video_agent/export/` | CapCut kit, After Effects `.jsx`, Premiere/Resolve XML, FCPXML 1.10, OpenTimelineIO, EDL, the all-in-one zip |
 | `video_agent/bot.py` · `cli.py` | Telegram bot · command line |
 | `video_agent/llm.py` | Claude, OpenRouter, Gemini and OpenAI, tried in `LLM_PROVIDERS` order with fallback |
 | `video_agent/storage.py` | `Brand_Identity`, `Edit_Blueprints`, `Template_Vault`, `Published_Media_Fingerprints`, `Learning_Weights` (PostgreSQL JSONB; SQLite fallback) |
@@ -329,7 +377,7 @@ the correct answer is known exactly:
 | Flash transitions + cool grade | 36.0 % | 57.7 % | **99.5 %** | **97.5 %** |
 
 The **real-Reels test** (`video-agent realtest`) produced the results at the top of this page.
-The **test suite** (64 tests) covers the engine, the After Effects import and the web UI:
+The **test suite** (72 tests) covers the engine, the After Effects import, the web UI, the editor and every export format:
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -355,6 +403,10 @@ The **test suite** (64 tests) covers the engine, the After Effects import and th
 - **Waiting on the Meta API key:** OAuth and webhooks, comment-to-DM, trend ingestion, auto-publishing,
   insights, and the performance half of the learning loop. These all go through `video_agent/meta.py`.
 - **The web UI is for local use only.** It has no login, and jobs are held in memory.
+- **Exports are checked as files, not in the apps.** Their structure, clip counts and media paths
+  are tested, but they haven't been opened in After Effects, Premiere, Resolve, Final Cut or CapCut
+  yet. Expect to relink media once, and to restyle text, which every app draws in its own way.
+- **Edits rendered before the editor existed** can't be opened in it; render them once more.
 
 ---
 

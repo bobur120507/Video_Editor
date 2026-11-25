@@ -4,7 +4,7 @@ Status of every roadmap item. `[x]` done and tested · `[~]` partly done · `[ ]
 Updated after each milestone. The **core goal is matching the cloned video's edit as closely as possible**, so the
 Matching Engine sections come first; publishing comes last.
 
-Last updated: 2026-11-24 (milestone: web UI with the stored audio graph; research in `docs/`)
+Last updated: 2026-11-24 (milestone: editor in the website and export to CapCut / After Effects / Premiere / Resolve / Final Cut)
 
 ---
 
@@ -279,6 +279,19 @@ When you have no footage: find clips/images that match each reference shot (~95%
 - [~] Bloom, motion-vector blur, flow retime, parametric shake in `ae/effects.py`: tested and measured, not wired into renders (vector blur matches a true shutter; flow retime ties `minterpolate` on average but has worse worst frames; no glow reference to tune bloom against)
 - [ ] Flash renders as 1 full + fading frames; an AE comp's 2 full-white frames come out 1 full + 1 half
 - [ ] The director is rule-based (no LLM), so the knowledge index has no prompt to go into yet; `knowledge.brief()` is ready for one
+
+## H4. Editor and export (`video_agent/project.py`, `video_agent/export/`, `web/editor.py`, `static/editor.js`)
+
+- [x] Every web render saves its edit as a project next to the video (`project.json`: the rendered blueprint + per shot the clip, in-point, framing), so it survives a restart and re-renders without re-planning
+- [x] Edit operations that keep the edit on the music: move a cut (neighbours trade time, whips follow the cut, speed points and the reference's camera/blur/motion curves stay where they were in time), split, remove (the shot before fills in), swap footage between slots, change a shot's clip / in-point / framing / speed / transition, add or remove moves (the review's words), texts, look sliders, render settings, new clips, new music; undo/redo history on disk
+- [x] Editor page (`#/edit/<id>`, "✂️ Edit it yourself" on a finished render, "Edits" in the menu): quick preview in the browser (clips at their cuts, speed and framing, text, simple punches/shakes/whips/flashes), timeline with thumbnails, beat ticks, draggable cuts snapping to beats and hits, draggable text ends, playhead; shot and text inspectors; the sound graph; "Render again" with progress; keyboard (Space, S, Delete, Ctrl+Z, arrows)
+- [x] Export: After Effects `.jsx` (builds the comp: layers at their speed, framing, punches/pushes/shakes/whips baked as keyframes, flashes, text, music, the agent's render as a guide layer), Premiere/Resolve FCP7 XML, FCPXML 1.10 (Final Cut, Resolve), OpenTimelineIO, EDL, a zip with media + every format + how-to, and a **CapCut kit** (one ready-cut, ready-framed clip per shot, music, texts.srt), since CapCut imports no timeline file
+- [x] A base folder on the other computer can be given, so the exported files open there without relinking
+- [x] Tests: every operation, undo/redo, flattening speed ramps into pieces, every format parses and points at the media, kit clips are exactly their shot's frames and shape, an edited project renders for real, the editor API end to end. Checked in the browser on a 22-shot Reel and a test edit: playback, split, undo, cut drag with snapping, text add/edit, real "Render again", all exports downloaded (light/dark, phone width)
+- [ ] Not opened in the real apps: the exports were checked as files (structure, clip counts, paths) but not imported into After Effects, Premiere, Resolve, Final Cut or CapCut here (none run on this Linux machine; Resolve does). Expect to relink once and adjust text styling
+- [ ] Not carried by the timeline formats: the grade, beat glows, motion smear and the shaped transitions (portal, panel, cut-out); they're in the agent's render that ships with the export, and marked on the timeline
+- [ ] Renders made before the editor existed have no project file and can't be opened (render them again)
+- [ ] The quick preview is approximate (no grade, glows or smear); "Last render" shows the real thing
 
 ## I. Waiting on the Meta API key
 

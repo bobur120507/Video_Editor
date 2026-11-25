@@ -1,5 +1,6 @@
 // Web UI over the same pipeline as the Telegram bot: /clone -> move review -> template -> /apply -> score.
 import { AudioGraph } from "/static/graph.js";
+import { editorView, editsView } from "/static/editor.js";
 
 const view = document.getElementById("view");
 const RATINGS = [
@@ -328,7 +329,8 @@ async function renderView(jobId) {
   const scoreBox = h("div", {}, progressBox(job));
   const side = h("section", { class: "card stack side" },
     h("h2", {}, `✅ v${r.version} · ${r.duration.toFixed(1)}s`),
-    h("div", { class: "row" }, h("a", { class: "btn", href: r.video, download: true }, "Download master")),
+    h("div", { class: "row" }, h("a", { class: "btn", href: r.video, download: true }, "Download master"),
+      r.project && h("a", { class: "btn primary", href: `#/edit/${r.project}` }, "✂️ Edit it yourself")),
     r.notes.map((n) => h("p", { class: "note" }, n)),
     h("div", { class: "thumbs" }, r.cover && h("figure", {}, h("img", { src: r.cover, alt: "Cover frame" }), h("figcaption", {}, "Cover")),
       r.grid && h("figure", {}, h("img", { src: r.grid, alt: "1:1 grid crop" }), h("figcaption", {}, "1:1 grid preview"))),
@@ -377,6 +379,8 @@ async function route() {
     else if (parts[0] === "templates") await templatesView();
     else if (parts[0] === "apply") await applyView(params);
     else if (parts[0] === "render" && parts[1]) await renderView(parts[1]);
+    else if (parts[0] === "edit" && parts[1]) await editorView(parts[1], { h, api, page, status, progressBox, poll, setNav, AudioGraph }, params);
+    else if (parts[0] === "edits") await editsView({ h, api, page, setNav });
     else cloneView();
   } catch (e) {
     page("Something went wrong", status(e.message, "error"));

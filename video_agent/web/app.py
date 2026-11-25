@@ -19,7 +19,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from .. import labels, storage
+from .. import labels, project, storage
 from ..ae import aep, lottie
 from ..analysis.audio import graph_for
 from ..blueprint import Blueprint
@@ -29,6 +29,7 @@ from ..media import sha256_file
 from ..pipeline import apply, clone
 from ..scoring import style_match
 from ..tweak import parse_feedback
+from . import editor
 
 log = logging.getLogger(__name__)
 
@@ -187,6 +188,14 @@ async def _render_job(app: web.Application, job: Job, bp: Blueprint, clips: list
     }
     app[RENDERS][job.id] = {"clips": clips, "dir": job_dir, "master": str(r.master), "template_id": template_id,
                               "blueprint_id": rendered.id, "version": version, "scores": {}, "upscale": upscale}
+    # The edit as a project the editor can open, change and export (kept next to the video).
+    tpl = await storage.get_template(_user(), template_id=template_id) if template_id else None
+    name = tpl.nickname if tpl else ""
+    proj = project.from_plan(outcome.blueprint, outcome.plan, clips, id=job_dir.name, name=name or outcome.blueprint.name or "edit",
+                             settings=project.RenderSettings(upscale=upscale), template_id=template_id,
+                             blueprint_id=rendered.id, rendered=str(r.master))
+    project.save(proj, job_dir)
+    job.result["project"] = job_dir.name
     reference = outcome.blueprint.source.path
     if reference and Path(reference).exists():
         job.step = "Measuring the match with the reference… (about as long as the video)"
@@ -437,6 +446,12 @@ def create_app() -> web.Application:
         await storage.init_db()
 
     app.on_startup.append(startup)
+
+    async def revalidate(request, response):  # the page's own scripts and styles: re-checked on each load, so updates show
+        if request.path.startswith("/static/") or request.path == "/":
+            response.headers["Cache-Control"] = "no-cache"
+
+    app.on_response_prepare.append(revalidate)
     app.router.add_get("/", index)
     app.router.add_static("/static", STATIC)
     app.router.add_get("/media/{path:.+}", get_media)
@@ -455,6 +470,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/apply", post_apply)
     app.router.add_post("/api/renders/{job_id}/change", post_change)
     app.router.add_post("/api/renders/{job_id}/rate", post_rate)
+    editor.add_routes(app)
     return app
 
 

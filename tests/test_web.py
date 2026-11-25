@@ -102,7 +102,9 @@ async def client(tmp_path, monkeypatch):
         for name in ("cover.jpg", "grid.jpg"):
             (out.parent / name).write_bytes(b"jpg")
         res = RenderResult(master=out, preview=out, cover=out.parent / "cover.jpg", grid=out.parent / "grid.jpg", duration=3.0)
-        return ApplyOutcome(result=res, plan=SimpleNamespace(warnings=["w"], missing=[]), blueprint=bp)
+        shots = [SimpleNamespace(clip=SimpleNamespace(path=clips[i % len(clips)]), src_start=0.0, center=(0.5, 0.5), content_match=0.0,
+                                 stats={}) for i in range(len(bp.segments))]
+        return ApplyOutcome(result=res, plan=SimpleNamespace(warnings=["w"], missing=[], shots=shots), blueprint=bp)
 
     monkeypatch.setattr(webapp, "clone", fake_clone)
     monkeypatch.setattr(webapp, "apply", fake_apply)
@@ -242,3 +244,51 @@ async def test_clone_accepts_an_aep_project(client, tmp_path):
     assert done["status"] == "done", done
     view = await (await client.get(f"/api/blueprints/{done['result']['blueprint_id']}")).json()
     assert view["imported"] and [c["transition"] for c in view["markers"]["cuts"]] == ["flash", "cut"]
+
+
+async def test_a_render_opens_in_the_editor(client, monkeypatch, tmp_path):
+    bp = _blueprint(get_settings().data_dir)
+    row = await storage.save_blueprint(get_settings().web_user_id, bp)
+    tpl = await storage.save_template(get_settings().web_user_id, "car_phonk", row.id)
+    clip = tmp_path / "clip.mp4"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=s=320x180:r=30:d=4", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", clip], check=True)
+    data = FormData()
+    data.add_field("template_id", str(tpl.id))
+    data.add_field("clips", clip.read_bytes(), filename="clip.mp4", content_type="video/mp4")
+    job = (await (await client.post("/api/apply", data=data)).json())["job"]
+    pid = (await _wait(client, job))["result"]["project"]
+
+    assert [p["name"] for p in await (await client.get("/api/projects")).json()] == ["car_phonk"]
+    p = await (await client.get(f"/api/projects/{pid}")).json()
+    assert len(p["shots"]) == 3 and p["undo"] is False and p["renders"][0]["url"].startswith(f"/api/projects/{pid}/file/")
+    assert p["markers"]["cuts"][0]["transition"] == "portal" and "capcut" in p["formats"]
+
+    p = await (await client.post(f"/api/projects/{pid}/edit", json={"op": "cut", "cut": 1, "t": 1.2})).json()
+    assert p["shots"][0]["end"] == 1.2 and p["undo"] is True
+    bad = await client.post(f"/api/projects/{pid}/edit", json={"op": "moves", "text": "hmm"})
+    assert bad.status == 400
+    p = await (await client.post(f"/api/projects/{pid}/edit", json={"op": "moves", "text": "add 2.5 shake"})).json()
+    assert p["done"] and any(m["kind"] == "shake" for m in p["shots"][2]["moves"])
+    p = await (await client.post(f"/api/projects/{pid}/undo")).json()
+    assert not any(m["kind"] == "shake" for m in p["shots"][2]["moves"]) and p["redo"] is True
+
+    thumb = await client.get(f"/api/projects/{pid}/thumb?clip=0&t=1")
+    assert thumb.status == 200 and thumb.content_type == "image/jpeg"
+    edl = await client.get(f"/api/projects/{pid}/export/edl")
+    assert edl.status == 200 and "car_phonk.edl" in edl.headers["Content-Disposition"] and "FROM CLIP NAME" in await edl.text()
+    assert (await client.get(f"/api/projects/{pid}/export/nope")).status == 404
+    assert (await client.get("/api/projects/..%2F..%2Fetc")).status == 404
+
+    def fake_render(bp, plan, out, opts):  # the real renderer is covered in test_project.py
+        opts.progress(0.5, "Shot 2 of 3")
+        out.write_bytes(b"edit 2")
+        return RenderResult(master=out, preview=out, cover=out, grid=out, duration=3.0)
+
+    monkeypatch.setattr(webapp.editor, "render", fake_render)
+    job = (await (await client.post(f"/api/projects/{pid}/render")).json())["job"]
+    done = await _wait(client, job)
+    assert done["status"] == "done", done
+    p = await (await client.get(f"/api/projects/{pid}")).json()
+    assert [r["name"] for r in p["renders"]] == ["edit_v1.mp4", "edit_v2.mp4"]
+    assert await (await client.get(done["result"]["video"])).read() == b"edit 2"
